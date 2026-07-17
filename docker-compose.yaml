@@ -1,0 +1,23 @@
+
+services:
+  database1:
+    image: postgres:16-alpine
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_HOST_AUTH_METHOD: trust
+      PGDATA: /data/postgres
+    volumes:
+      - db1:/data/postgres      
+      # - ./00-create-databases.sql:/docker-entrypoint-initdb.d/00-create-databases.sql
+      # - ./02-insert-data.sql:/docker-entrypoint-initdb.d/02-insert-data.sql
+    networks:
+      - default
+    ports:
+      - 5432:5432
+    
+networks:
+  default:
+
+volumes:
+  db1:
