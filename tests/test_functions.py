@@ -5,7 +5,7 @@ from datetime import datetime
 from pytest_postgresql import factories
 import sqlalchemy as sa
 from pytest import fixture
-from sqlalchemy import URL, UUID, Column, DateTime, Integer, MetaData, String, Table, create_engine, text
+from sqlalchemy import UUID, Column, DateTime, Integer, MetaData, String, Table, text
 from sqlalchemy.orm import Session
 
 from src.db_engine import setup_engine
