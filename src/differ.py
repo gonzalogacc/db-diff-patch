@@ -150,9 +150,27 @@ def get_tables(engine):
     return pairs
 
 
-def make_all_checks(engine, prod_table, clone_table) -> list[str]:
+def make_all_checks(engine, local_table, remote_table) -> list[str]:
     return [
-        *check_deletions(engine, clone_table, prod_table),
-        *check_insertions(engine, clone_table, prod_table),
-        *check_updates(engine, clone_table, prod_table)
+        *check_deletions(engine, local_table, remote_table),
+        *check_insertions(engine, local_table, remote_table),
+        *check_updates(engine, local_table, remote_table)
     ]
+
+
+def make_diff_patch(engine) -> str:
+
+    commands = []
+    commands.append("BEGIN")
+
+    table_pairs = get_tables(engine)
+    
+    for table_pair in table_pairs:
+        if table_pair.prod.name in ['orders']:
+            continue
+
+        for command in make_all_checks(engine, table_pair.clone, table_pair.prod):
+            commands.append(str(command))
+
+    commands.append("COMMIT")
+    return "\n".join(commands)

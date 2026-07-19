@@ -3,11 +3,10 @@ from dataclasses import dataclass
 
 from sqlalchemy import MetaData, Table, create_engine
 from sqlalchemy.orm import Session
-# from table_models import local_users, remote_users
 import sqlalchemy as sa
 
-from db_engine import setup_engine
-from differ import get_tables, make_all_checks
+from src.db_engine import setup_engine
+from src.differ import get_tables, make_all_checks
 
 
 def main():
@@ -28,25 +27,6 @@ def main():
         for x in make_all_checks(engine, local_users, remote_users):
             print(x)
     print("COMMIT")
-
-    # print()
-    # print("local")
-    # print("------------------------------")
-    # with Session(engine) as session:
-    #     stmt = sa.select(local_users)
-    #     response = session.execute(stmt).all()
-    #     for r in response:
-    #         print(r)
-    
-    # print()
-    # print("remote")
-    # print("------------------------------")
-    # with Session(engine) as session:
-    #     stmt = sa.select(remote_users)
-    #     response = session.execute(stmt).all()
-    #     for r in response:
-    #         print(r)
-
 
     
     
