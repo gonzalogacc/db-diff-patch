@@ -54,7 +54,7 @@ def link_dbs(local: DBConnection, remote: DBConnection):
         session.commit()
 
 
-def check_deletions(engine, local_table, remote_table) -> list:
+def check_deletions(engine: sa.Engine, local_table: sa.Table, remote_table: sa.Table) -> list:
     """Find the deletion between tables."""
     table_key = [c for c in local_table.columns][0].name
 

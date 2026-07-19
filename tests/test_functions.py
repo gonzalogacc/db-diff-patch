@@ -23,7 +23,7 @@ def _populate_db(engine):
         extend_existing=True
     )
 
-    movies = Table(
+    Table(
         "movies",
         metadata,
         Column('id', Integer, primary_key=True),
@@ -32,7 +32,7 @@ def _populate_db(engine):
         extend_existing=True
     )
 
-    books = Table(
+    Table(
         'books',
         metadata,
         Column("book_uuid", UUID, primary_key=True),
@@ -41,7 +41,7 @@ def _populate_db(engine):
         extend_existing=True
     )
 
-    orders = Table(
+    Table(
         "orders",
         metadata,
         Column("user_id", Integer, primary_key=True),

@@ -1,8 +1,8 @@
 
-from sqlalchemy import URL, create_engine
+from sqlalchemy import URL, Engine, create_engine
 
 
-def setup_engine(host, port, db_name, username):
+def setup_engine(host, port, db_name, username) -> Engine:
     url_object = URL.create(
         "postgresql+psycopg2",
         username=username,
