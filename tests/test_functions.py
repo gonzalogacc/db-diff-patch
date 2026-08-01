@@ -5,12 +5,12 @@ from datetime import datetime
 from pytest_postgresql import factories
 import sqlalchemy as sa
 from pytest import fixture
-from sqlalchemy import UUID, Column, DateTime, Integer, MetaData, String, Table, text
+from sqlalchemy import UUID, Column, DateTime, ForeignKey, Integer, MetaData, String, Table, text
 from sqlalchemy.orm import Session
 
 from src.db_engine import setup_engine
-from src.differ import DBConnection, check_deletions, check_insertions, check_updates, get_tables, link_dbs, make_all_checks, make_diff_patch
-
+from src.differ import DBConnection, check_deletions, check_insertions, check_updates, get_table_keys, get_tables, link_dbs, make_all_checks, make_diff_patch
+from sqlalchemy_utils import drop_database
 
 def _populate_db(engine):
     metadata = MetaData()
@@ -46,10 +46,24 @@ def _populate_db(engine):
         metadata,
         Column("user_id", Integer, primary_key=True),
         Column("book_uuid", UUID, primary_key=True),
+        # Column("user_id", Integer, ForeignKey("users.id"), primary_key=True),
+        # Column("book_uuid", UUID, ForeignKey("books.book_uuid"), primary_key=True),
         Column("order_date", DateTime),
         Column("quantity", Integer),
         extend_existing=True
     )
+
+    table_with_multiple_pks = Table(
+        "table_with_multiple_pks",
+        metadata,
+        Column("pk1", Integer, primary_key=True),
+        Column("pk2", Integer, primary_key=True),
+        Column("c1", Integer),
+        Column("c2", Integer),
+        Column("c3", Integer),
+        # Column(not a pk),
+    )
+
     metadata.create_all(engine)
 
     with Session(engine) as session:
@@ -69,6 +83,16 @@ def _populate_db(engine):
         session.execute(sa.insert(users), user_insert)
         session.commit()
 
+        pk_test_data = [
+            (1,11,111,1111,11111),
+            (2,22,222,2222,22222),
+            (3,33,333,3333,33333),
+        ]
+        pk_insert = [dict(pk1=c1, pk2=c2, c1=c3, c2=c4, c3=c5) for c1, c2, c3, c4, c5 in pk_test_data]
+        session.execute(sa.insert(table_with_multiple_pks), pk_insert)
+        session.commit() 
+
+        
 # db = factories.postgresql('postgresql_noproc')
 db_local = factories.postgresql('postgresql_noproc', dbname="db1-uno")
 db_remote = factories.postgresql('postgresql_noproc', dbname="db2-dos")
@@ -83,7 +107,6 @@ def setup_database_local(db_local):
     )
     _populate_db(engine)
     yield engine
-    # delete database here
 
 @fixture
 def setup_database_remote(db_remote):
@@ -167,6 +190,22 @@ def test_deletions_detect(
     assert len(deletions) == deleted_count
 
 
+# def test_delete_detecting_pks():
+#     # test delete a composite key table
+#     orders_table = metadata.tables['orders']
+#     with Session(engine) as session:
+#         stmt = orders_table.delete().where(orders_table.c.user_id==1)
+#         response = session.execute(stmt)
+#         deleted_count = response.rowcount
+#         session.commit()
+
+#     table_pairs = get_tables(engine)
+#     orders_table_paris = table_pairs[3]
+
+#     deletions = check_deletions(engine, orders_table_paris.clone, orders_table_paris.prod)
+#     assert len(deletions) == deleted_count 
+
+
 def test_insertions_detect(
     setup_database_local, 
     linked_databases,
@@ -188,7 +227,7 @@ def test_insertions_detect(
             stmt = users_table.insert().values(**user)
             session.execute(stmt)
         session.commit()
-        
+     
     table_pairs = get_tables(engine)
     user_table_paris = table_pairs[0]
 
@@ -332,3 +371,196 @@ def test_make_diff_patch(
     assert 3 == len([sql for sql in diff_patch.split('\n') if 'public.users' in sql and 'DELETE' in sql])
     assert 3 == len([sql for sql in diff_patch.split('\n') if 'public.users' in sql and 'INSERT' in sql])
 
+
+def test_multiple_keys(
+    setup_database_local,
+    linked_databases
+):
+    """Identify keys."""
+    engine = setup_database_local
+    metadata = MetaData()
+    metadata.reflect(bind=engine)
+    multikey_table = metadata.tables['table_with_multiple_pks']
+
+    table_keys = get_table_keys(multikey_table)
+    assert len(table_keys) == 2
+    table_key_names = [table.name for table in table_keys]
+    assert 'pk1' in table_key_names
+    assert 'pk2' in table_key_names
+
+
+def _get_table_pair(table_pairs, name):
+    """Look up a TablePair by table name instead of relying on list position."""
+    return next(pair for pair in table_pairs if pair.prod.name == name)
+
+
+def test_deletions_detect_multiple_keys(
+    setup_database_local,
+    linked_databases,
+):
+    """Check deletions are correctly detected on a table with a composite primary key."""
+    engine = setup_database_local
+
+    metadata = MetaData()
+    metadata.reflect(bind=engine)
+    multikey_table = metadata.tables['table_with_multiple_pks']
+
+    with Session(engine) as session:
+        stmt = multikey_table.delete().where(multikey_table.c.pk1.in_([2, 3]))
+        response = session.execute(stmt)
+        deleted_count = response.rowcount
+        session.commit()
+
+    table_pairs = get_tables(engine)
+    multikey_pair = _get_table_pair(table_pairs, 'table_with_multiple_pks')
+
+    deletions = check_deletions(engine, multikey_pair.clone, multikey_pair.prod)
+    assert len(deletions) == deleted_count
+
+    deletion_sql = [str(d) for d in deletions]
+    # Both key columns must appear in each generated statement, ANDed together,
+    # otherwise a delete could match more rows than the one that was actually removed.
+    assert any('pk1 = 2' in sql and 'pk2 = 22' in sql for sql in deletion_sql)
+    assert any('pk1 = 3' in sql and 'pk2 = 33' in sql for sql in deletion_sql)
+
+
+def test_deletions_detect_partial_composite_key(
+    setup_database_local,
+    setup_database_remote,
+    linked_databases,
+):
+    """A pk1-only key match misses a deletion when a sibling row shares pk1.
+
+    Two rows share pk1=1 (pk2=11 and pk2=999) in both local and remote.
+    Only the pk2=999 row is deleted locally; pk2=11 survives untouched.
+    An implementation keyed on the first PK column alone sees pk1=1 still
+    present in local (via the surviving pk2=11 row) and reports zero
+    deletions, silently missing the row that needs to be removed from prod.
+    """
+    local_engine = setup_database_local
+    remote_engine = setup_database_remote
+
+    local_metadata = MetaData()
+    local_metadata.reflect(bind=local_engine)
+    local_multikey_table = local_metadata.tables['table_with_multiple_pks']
+
+    remote_metadata = MetaData()
+    remote_metadata.reflect(bind=remote_engine)
+    remote_multikey_table = remote_metadata.tables['table_with_multiple_pks']
+
+    extra_row = dict(pk1=1, pk2=999, c1=1, c2=2, c3=3)
+    with Session(local_engine) as session:
+        session.execute(local_multikey_table.insert().values(**extra_row))
+        session.commit()
+    with Session(remote_engine) as session:
+        session.execute(remote_multikey_table.insert().values(**extra_row))
+        session.commit()
+
+    with Session(local_engine) as session:
+        stmt = local_multikey_table.delete().where(
+            local_multikey_table.c.pk1 == 1,
+            local_multikey_table.c.pk2 == 999,
+        )
+        response = session.execute(stmt)
+        deleted_count = response.rowcount
+        session.commit()
+
+    table_pairs = get_tables(local_engine)
+    multikey_pair = _get_table_pair(table_pairs, 'table_with_multiple_pks')
+
+    deletions = check_deletions(local_engine, multikey_pair.clone, multikey_pair.prod)
+
+    assert len(deletions) == deleted_count == 1
+
+    deletion_sql = str(deletions[0])
+    assert 'pk1 = 1' in deletion_sql
+    assert 'pk2 = 999' in deletion_sql
+    # must not target the surviving sibling row that shares pk1
+    assert 'pk2 = 11' not in deletion_sql
+
+
+def test_insertions_detect_multiple_keys(
+    setup_database_local,
+    linked_databases,
+):
+    """check_insertions must key off every PK column, not just the first one.
+
+    This row shares pk1=1 with an existing remote row (pk1=1, pk2=11) and is
+    only distinguished by pk2=999. An implementation that diffs on pk1 alone
+    will see pk1=1 already present remotely and silently drop this insert.
+    """
+    engine = setup_database_local
+
+    metadata = MetaData()
+    metadata.reflect(bind=engine)
+    multikey_table = metadata.tables['table_with_multiple_pks']
+
+    with Session(engine) as session:
+        stmt = multikey_table.insert().values(pk1=1, pk2=999, c1=1, c2=2, c3=3)
+        session.execute(stmt)
+        session.commit()
+
+    table_pairs = get_tables(engine)
+    multikey_pair = _get_table_pair(table_pairs, 'table_with_multiple_pks')
+
+    insertions = check_insertions(engine, multikey_pair.clone, multikey_pair.prod)
+    assert len(insertions) == 1
+
+    insertion_sql = str(insertions[0])
+    assert 'pk1' in insertion_sql and '999' in insertion_sql
+
+
+def test_check_updates_multiple_keys(
+    setup_database_local,
+    setup_database_remote,
+    linked_databases,
+):
+    """check_updates must key off every PK column, not just the first one.
+
+    Two rows share pk1=1 (pk2=11 and pk2=999) in both local and remote, and
+    both get modified locally with different values. An implementation that
+    matches modified rows by pk1 alone collapses both rows onto a single id
+    (1) and only keeps one of the two updates, silently dropping the other.
+    """
+    local_engine = setup_database_local
+    remote_engine = setup_database_remote
+
+    local_metadata = MetaData()
+    local_metadata.reflect(bind=local_engine)
+    local_multikey_table = local_metadata.tables['table_with_multiple_pks']
+
+    remote_metadata = MetaData()
+    remote_metadata.reflect(bind=remote_engine)
+    remote_multikey_table = remote_metadata.tables['table_with_multiple_pks']
+
+    extra_row = dict(pk1=1, pk2=999, c1=1, c2=2, c3=3)
+    with Session(local_engine) as session:
+        session.execute(local_multikey_table.insert().values(**extra_row))
+        session.commit()
+    with Session(remote_engine) as session:
+        session.execute(remote_multikey_table.insert().values(**extra_row))
+        session.commit()
+
+    with Session(local_engine) as session:
+        session.execute(
+            sa.update(local_multikey_table)
+            .where(local_multikey_table.c.pk1 == 1, local_multikey_table.c.pk2 == 11)
+            .values(c1=500)
+        )
+        session.execute(
+            sa.update(local_multikey_table)
+            .where(local_multikey_table.c.pk1 == 1, local_multikey_table.c.pk2 == 999)
+            .values(c1=600)
+        )
+        session.commit()
+
+    table_pairs = get_tables(local_engine)
+    multikey_pair = _get_table_pair(table_pairs, 'table_with_multiple_pks')
+
+    updates = check_updates(local_engine, multikey_pair.clone, multikey_pair.prod)
+
+    assert len(updates) == 2
+
+    update_sql = [str(u) for u in updates]
+    assert any('pk2 = 11' in sql and 'c1=500' in sql for sql in update_sql)
+    assert any('pk2 = 999' in sql and 'c1=600' in sql for sql in update_sql)

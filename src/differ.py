@@ -26,7 +26,6 @@ class DBPair:
     remote: DBConnection
 
 
-
 def link_dbs(local: DBConnection, remote: DBConnection):
     """Function to connect the pairs."""
     # Here i need to log into the local engine and link the remote 
@@ -54,20 +53,38 @@ def link_dbs(local: DBConnection, remote: DBConnection):
         session.commit()
 
 
+def get_table_keys(table: sa.Table) -> list[sa.Column]:
+    """Given a table return the primary key columns from that table."""
+    return [column for column in table.c if column.primary_key]
+
+
+def print_stmt(stmt) -> None:
+    compiled = stmt.compile(compile_kwargs={"literal_binds": True})
+    print(compiled)
+
+
 def check_deletions(engine: sa.Engine, local_table: sa.Table, remote_table: sa.Table) -> list:
     """Find the deletion between tables."""
-    table_key = [c for c in local_table.columns][0].name
-
+    local_keys = [
+        getattr(local_table.c, table_key.name)
+        for table_key in get_table_keys(local_table)
+    ]
+    remote_keys = [
+        getattr(remote_table.c, table_key.name)
+        for table_key in get_table_keys(local_table)
+    ] 
+    
     # Deleted are fields in the remote but not in the local db
     with Session(engine) as session:
         # Returns all ids in the remote that are not in the local. They were deleted.
-        stmt = sa.select(getattr(remote_table.c, table_key)).except_(sa.select(getattr(local_table.c, table_key)))
+        stmt = sa.select(*remote_keys).except_(sa.select(*local_keys))
         deleted_rows = session.execute(stmt).all()
 
         deletion_list = []
-        for d in deleted_rows:
-            deleted_id = d[0]
-            stmt = sa.delete(local_table).where(getattr(local_table.c, table_key) == deleted_id)
+        for deleted_ids in deleted_rows:
+            stmt = sa.delete(local_table).where(
+                *[table_key == key_value for table_key, key_value in zip(local_keys, deleted_ids, strict=True)]
+            )
             deletion_list.append(stmt.compile(engine, compile_kwargs={"literal_binds": True}))
 
     return deletion_list
@@ -75,15 +92,24 @@ def check_deletions(engine: sa.Engine, local_table: sa.Table, remote_table: sa.T
 
 def check_insertions(engine, local_table, remote_table) -> list:
     """Find the insertions between tables."""
-    table_key = [c for c in local_table.columns][0].name
+    local_keys = [
+        getattr(local_table.c, table_key.name)
+        for table_key in get_table_keys(local_table)
+    ]
+    remote_keys = [
+        getattr(remote_table.c, table_key.name)
+        for table_key in get_table_keys(local_table)
+    ] 
+    
     with Session(engine) as session:
-        stmt = sa.select(getattr(local_table.c, table_key)).except_(sa.select(getattr(remote_table.c, table_key)))
+        stmt = sa.select(*local_keys).except_(sa.select(*remote_keys))
         inserted_rows = session.execute(stmt).all() 
         
         insert_list = [] 
-        for ir in inserted_rows:
-            inserted_id = ir[0]
-            stmt = sa.select(local_table).where(getattr(local_table.c, table_key) == inserted_id)
+        for inserted_ids in inserted_rows:
+            stmt = sa.select(local_table).where(
+                *[table_key == key_value for table_key, key_value in zip(local_keys, inserted_ids, strict=True)]
+            )
             response = session.execute(stmt).one()
 
             # remap columns
@@ -97,32 +123,37 @@ def check_insertions(engine, local_table, remote_table) -> list:
     return insert_list
 
 
-def check_updates(engine, local_table, remote_table) -> list:
-    table_key = [c for c in local_table.columns][0].name
-    # Returns all ids in the remote that are not in the local. They were deleted.
+def check_updates(engine, local_table: sa.Table, remote_table: sa.Table) -> list:
+    key_columns = get_table_keys(local_table)
+    key_names = {c.name for c in key_columns}
+    key_indices = [index for index, column in enumerate(local_table.c) if column.name in key_names]
+
+    def row_key(row):
+        return tuple(row[i] for i in key_indices)
+
     with Session(engine) as session:
         stmt = sa.select(remote_table).except_(sa.select(local_table))
-        remote_exclusive = session.execute(stmt).all() 
+        remote_exclusive = session.execute(stmt).all()
 
         stmt = sa.select(local_table).except_(sa.select(remote_table))
-        local_exclusive = session.execute(stmt).all() 
-        
-        # If a row is shared by the id then it's modified in both
-        shared_result = set([x[0] for x in remote_exclusive]) & set([x[0] for x in local_exclusive])
-        
+        local_exclusive = session.execute(stmt).all()
+
+        # If a row's key is shared by both sides then it's modified, not inserted/deleted
+        shared_keys = {row_key(r) for r in remote_exclusive} & {row_key(r) for r in local_exclusive}
+
         update_list = []
-        for sr in shared_result:
-            local_version = [obj for obj in local_exclusive if obj[0] == sr][0]
-            remote_version = [obj for obj in remote_exclusive if obj[0] == sr][0]
+        for key_values in shared_keys:
+            local_row = next(r for r in local_exclusive if row_key(r) == key_values)
+            remote_row = next(r for r in remote_exclusive if row_key(r) == key_values)
             ## Compare field by field to get the differences and construct the sql update
             changed = {}
-            for name, remote_field, local_field in zip(remote_table.c, remote_version, local_version):
-                if name.name == table_key:
-                    id_value = local_field
+            for column, remote_field, local_field in zip(local_table.c, remote_row, local_row):
+                if column.name in key_names:
                     continue
                 if remote_field != local_field:
-                    changed[name.name] = local_field
-            stmt = sa.update(local_table).where(getattr(local_table.c, table_key) == id_value).values(**changed)
+                    changed[column.name] = local_field
+            where_clauses = [column == value for column, value in zip(key_columns, key_values)]
+            stmt = sa.update(local_table).where(*where_clauses).values(**changed)
             update_list.append(stmt.compile(engine, compile_kwargs={"literal_binds": True}))
 
     return update_list

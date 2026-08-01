@@ -8,6 +8,7 @@ dependencies = [
     "psycopg2-binary>=2.9.12",
     "pytest-postgresql>=8.1.0",
     "sqlalchemy>=2.0.51",
+    "sqlalchemy-utils>=0.42.1",
 ]
 
 [dependency-groups]
