@@ -1,8 +1,11 @@
 from copy import copy
 from dataclasses import dataclass
+from enum import StrEnum
 
+from networkx import DiGraph, is_directed_acyclic_graph, topological_sort
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
+from sqlalchemy.sql.compiler import SQLCompiler
 
 from src.db_engine import setup_engine
 
@@ -24,6 +27,19 @@ class DBPair:
     """
     local: DBConnection
     remote: DBConnection
+
+
+class OperationType(StrEnum):
+    DELETE = "delete"
+    UPDATE = "update"
+    INSERT = "insert"
+
+
+@dataclass
+class DatabaseOperation:
+    table_name: str
+    operation: OperationType
+    statement: SQLCompiler
 
 
 def link_dbs(local: DBConnection, remote: DBConnection):
@@ -63,7 +79,7 @@ def print_stmt(stmt) -> None:
     print(compiled)
 
 
-def check_deletions(engine: sa.Engine, local_table: sa.Table, remote_table: sa.Table) -> list:
+def check_deletions(engine: sa.Engine, local_table: sa.Table, remote_table: sa.Table) -> list[DatabaseOperation]:
     """Find the deletion between tables."""
     local_keys = [
         getattr(local_table.c, table_key.name)
@@ -85,12 +101,18 @@ def check_deletions(engine: sa.Engine, local_table: sa.Table, remote_table: sa.T
             stmt = sa.delete(local_table).where(
                 *[table_key == key_value for table_key, key_value in zip(local_keys, deleted_ids, strict=True)]
             )
-            deletion_list.append(stmt.compile(engine, compile_kwargs={"literal_binds": True}))
+            deletion_list.append(
+                DatabaseOperation(
+                    table_name=local_table.name,
+                    operation=OperationType.DELETE,
+                    statement=stmt.compile(engine, compile_kwargs={"literal_binds": True})
+                )
+            )
 
     return deletion_list
 
 
-def check_insertions(engine, local_table, remote_table) -> list:
+def check_insertions(engine, local_table, remote_table) -> list[DatabaseOperation]:
     """Find the insertions between tables."""
     local_keys = [
         getattr(local_table.c, table_key.name)
@@ -118,12 +140,18 @@ def check_insertions(engine, local_table, remote_table) -> list:
                 data[c.name] = response[i]
             
             stmt = sa.insert(local_table).values(**data)
-            insert_list.append(stmt.compile(engine, compile_kwargs={"literal_binds": True}))
+            insert_list.append(
+                DatabaseOperation(
+                    table_name=local_table.name,
+                    operation=OperationType.INSERT,
+                    statement=stmt.compile(engine, compile_kwargs={"literal_binds": True})
+                )
+            )
 
     return insert_list
 
 
-def check_updates(engine, local_table: sa.Table, remote_table: sa.Table) -> list:
+def check_updates(engine, local_table: sa.Table, remote_table: sa.Table) -> list[DatabaseOperation]:
     key_columns = get_table_keys(local_table)
     key_names = {c.name for c in key_columns}
     key_indices = [index for index, column in enumerate(local_table.c) if column.name in key_names]
@@ -154,7 +182,13 @@ def check_updates(engine, local_table: sa.Table, remote_table: sa.Table) -> list
                     changed[column.name] = local_field
             where_clauses = [column == value for column, value in zip(key_columns, key_values)]
             stmt = sa.update(local_table).where(*where_clauses).values(**changed)
-            update_list.append(stmt.compile(engine, compile_kwargs={"literal_binds": True}))
+            update_list.append(
+                DatabaseOperation(
+                    table_name=local_table.name,
+                    operation=OperationType.UPDATE,
+                    statement=stmt.compile(engine, compile_kwargs={"literal_binds": True})
+                )
+            )
 
     return update_list
 
@@ -181,7 +215,7 @@ def get_tables(engine):
     return pairs
 
 
-def make_all_checks(engine, local_table, remote_table) -> list[str]:
+def make_all_checks(engine, local_table, remote_table) -> list[DatabaseOperation]:
     return [
         *check_deletions(engine, local_table, remote_table),
         *check_insertions(engine, local_table, remote_table),
@@ -192,16 +226,80 @@ def make_all_checks(engine, local_table, remote_table) -> list[str]:
 def make_diff_patch(engine) -> str:
 
     commands = []
-    commands.append("BEGIN")
+    commands.append("BEGIN;")
 
     table_pairs = get_tables(engine)
-    
+
+    all_ops = []
     for table_pair in table_pairs:
-        if table_pair.prod.name in ['orders']:
+        all_ops.extend(make_all_checks(engine, table_pair.clone, table_pair.prod))
+
+    graph = _build_table_graph(engine)
+    table_order = _topological_table_sort(graph)
+    for op in sort_ops(all_ops, table_order):
+        commands.append(f"{op.statement};")
+
+    commands.append("COMMIT;")
+    return "\n".join(commands)
+
+
+def _build_table_graph(engine) -> DiGraph:
+    """Create a Directed graph of the table relations in the database.
+
+    Each edge points from a table to the table its foreign key references,
+    e.g. orders -> users. This means a plain topological sort of the graph
+    yields a child-before-parent order.
+    """
+    metadata = sa.MetaData()
+    metadata.reflect(bind=engine)
+
+    graph = DiGraph()
+    for table_name, table_obj in metadata.tables.items():
+        if not table_obj.foreign_keys:
+            graph.add_node(table_name)
             continue
 
-        for command in make_all_checks(engine, table_pair.clone, table_pair.prod):
-            commands.append(str(command))
+        for fk_constraint in table_obj.foreign_keys:
+            graph.add_edge(table_name, fk_constraint.column.table.name)
 
-    commands.append("COMMIT")
-    return "\n".join(commands)
+    return graph
+
+
+def _topological_table_sort(graph) -> list[str]:
+    """Return tables in parent-before-child order, safe for inserts."""
+    if not is_directed_acyclic_graph(graph):
+        raise Exception("Graph is not Directed and acyclical, can't be sorted.")
+    tps = topological_sort(graph)
+    return list(reversed(list(tps)))
+
+
+_OPERATION_PHASE = {
+    OperationType.INSERT: 0,
+    OperationType.UPDATE: 1,
+    OperationType.DELETE: 2,
+}
+
+
+def sort_ops(ops: list[DatabaseOperation], table_order: list[str]) -> list[DatabaseOperation]:
+    """Order operations so applying them never violates a FK constraint.
+
+    table_order must be a parent-before-child table ordering (as returned by
+    _topological_table_sort). Operations are grouped into three phases:
+    inserts (parent-first, so referenced rows exist before their children),
+    updates (order doesn't matter - a changed FK value can only point at a
+    row that already exists or was just inserted in this same patch), and
+    deletes (child-first, so a row is removed before the parent it
+    references).
+    """
+    table_rank = {table_name: rank for rank, table_name in enumerate(table_order)}
+
+    def sort_key(op: DatabaseOperation):
+        phase = _OPERATION_PHASE[op.operation]
+        rank = table_rank.get(op.table_name, len(table_rank))
+        if op.operation == OperationType.DELETE:
+            rank = -rank
+        return (phase, rank)
+
+    return sorted(ops, key=sort_key)
+
+
