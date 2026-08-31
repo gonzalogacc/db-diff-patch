@@ -15,6 +15,7 @@ from src.differ import (
     OperationType,
     _build_table_graph,
     _topological_table_sort,
+    apply_patch_file,
     check_deletions,
     check_insertions,
     check_updates,
@@ -897,3 +898,104 @@ def test_make_diff_patch_applies_without_fk_violation(
     assert sorted(remaining_publishers) == [2]
     assert sorted(remaining_authors) == [2]
     assert sorted(remaining_editions) == [2]
+
+
+def test_link_dbs_is_idempotent(
+    setup_database_local,
+    setup_database_remote,
+    db_local,
+    db_remote,
+):
+    """link_dbs must not error when called twice against the same pair, since
+    a real `diff` command needs to be re-runnable against the same branch as
+    someone edits the modify database."""
+    local = DBConnection(
+        host=db_local.info.host,
+        port=db_local.info.port,
+        username=db_local.info.user,
+        dbname=db_local.info.dbname,
+    )
+    remote = DBConnection(
+        host=db_remote.info.host,
+        port=db_remote.info.port,
+        username=db_remote.info.user,
+        dbname=db_remote.info.dbname,
+    )
+
+    link_dbs(local, remote)
+    link_dbs(local, remote)
+
+
+def test_link_dbs_includes_password_in_user_mapping_when_given(
+    setup_database_local,
+    setup_database_remote,
+    db_local,
+    db_remote,
+):
+    """CREATE USER MAPPING must include the password option when the remote
+    connection has one - Postgres requires it for non-superusers (e.g. Cloud
+    SQL's own "postgres" role isn't a true superuser there), otherwise
+    CREATE SERVER/IMPORT FOREIGN SCHEMA fails with "password is required"."""
+    local = DBConnection(
+        host=db_local.info.host,
+        port=db_local.info.port,
+        username=db_local.info.user,
+        dbname=db_local.info.dbname,
+    )
+    remote = DBConnection(
+        host=db_remote.info.host,
+        port=db_remote.info.port,
+        username=db_remote.info.user,
+        dbname=db_remote.info.dbname,
+        password="irrelevant-for-trust-auth-but-must-not-error",
+    )
+
+    link_dbs(local, remote)
+
+    with Session(setup_database_local) as session:
+        mapping_options = session.execute(
+            sa.text(
+                "SELECT umoptions FROM pg_user_mappings "
+                "WHERE srvname = 'remote_server' AND usename = current_user"
+            )
+        ).scalar()
+
+    assert any(opt.startswith("password=") for opt in mapping_options)
+
+
+def test_apply_patch_file(
+    setup_database_local,
+    setup_database_remote,
+    linked_databases,
+    tmp_path,
+    db_remote,
+):
+    """apply_patch_file must read a patch saved to disk and apply it to the
+    target database, exercising the file-based generate -> apply handoff."""
+    local_engine = setup_database_local
+    remote_engine = setup_database_remote
+
+    local_metadata = MetaData()
+    local_metadata.reflect(bind=local_engine)
+    users_table = local_metadata.tables['users']
+
+    with Session(local_engine) as session:
+        session.execute(users_table.delete().where(users_table.c.id > 7))
+        session.commit()
+
+    diff_patch = make_diff_patch(local_engine)
+    patch_path = tmp_path / "patch.sql"
+    patch_path.write_text(diff_patch)
+
+    remote_connection = DBConnection(
+        host=db_remote.info.host,
+        port=db_remote.info.port,
+        username=db_remote.info.user,
+        dbname=db_remote.info.dbname,
+    )
+    apply_patch_file(patch_path, remote_connection)
+
+    with Session(remote_engine) as session:
+        remaining = session.execute(sa.select(users_table.c.id)).scalars().all()
+
+    assert sorted(remaining) == [1, 2, 3, 4, 5, 6, 7]

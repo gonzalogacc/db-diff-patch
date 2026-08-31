@@ -1,6 +1,7 @@
 from copy import copy
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
 
 from networkx import DiGraph, is_directed_acyclic_graph, topological_sort
 import sqlalchemy as sa
@@ -43,28 +44,71 @@ class DatabaseOperation:
 
 
 def link_dbs(local: DBConnection, remote: DBConnection):
-    """Function to connect the pairs."""
-    # Here i need to log into the local engine and link the remote 
+    """Link the local db to the remote one via postgres_fdw.
+
+    Idempotent: safe to call repeatedly against the same pair (e.g. running
+    `diff` more than once against the same branch) - each step is skipped if
+    it was already done by a previous call.
+    """
     local_engine = setup_engine(
         local.host,
         local.port,
         local.dbname,
-        local.username
+        local.username,
+        local.password
     )
 
     with Session(local_engine) as session:
 
         session.execute(sa.text("CREATE EXTENSION IF NOT EXISTS postgres_fdw"))
-        session.execute(
-            sa.text(f"CREATE SERVER remote_server foreign data wrapper postgres_fdw options (host '{remote.host}', port '{remote.port}', dbname '{remote.dbname}')"),
-            {"host": remote.host, "port": remote.port, "dbname": remote.dbname}
-        ) 
-        session.execute(
-            sa.text("CREATE USER MAPPING FOR user SERVER remote_server OPTIONS (user :user)"),
-            {"user": remote.username}
-        )
-        session.execute(sa.text("CREATE SCHEMA remote_server_schema"))
-        session.execute(sa.text("IMPORT FOREIGN SCHEMA public from server remote_server into remote_server_schema"))
+
+        server_exists = session.execute(
+            sa.text("SELECT 1 FROM pg_foreign_server WHERE srvname = 'remote_server'")
+        ).first()
+        if not server_exists:
+            session.execute(
+                sa.text(
+                    "CREATE SERVER remote_server FOREIGN DATA WRAPPER postgres_fdw "
+                    "OPTIONS (host :host, port :port, dbname :dbname)"
+                ),
+                {"host": remote.host, "port": str(remote.port), "dbname": remote.dbname}
+            )
+
+        mapping_exists = session.execute(
+            sa.text(
+                "SELECT 1 FROM pg_user_mappings "
+                "WHERE srvname = 'remote_server' AND usename = current_user"
+            )
+        ).first()
+        if not mapping_exists:
+            # Postgres requires the password in the mapping for non-superusers
+            # (Cloud SQL's own "postgres" role isn't a true superuser there),
+            # otherwise CREATE SERVER/IMPORT FOREIGN SCHEMA later fails with
+            # "password is required".
+            if remote.password:
+                session.execute(
+                    sa.text(
+                        "CREATE USER MAPPING FOR user SERVER remote_server "
+                        "OPTIONS (user :user, password :password)"
+                    ),
+                    {"user": remote.username, "password": remote.password}
+                )
+            else:
+                session.execute(
+                    sa.text("CREATE USER MAPPING FOR user SERVER remote_server OPTIONS (user :user)"),
+                    {"user": remote.username}
+                )
+
+        schema_exists = session.execute(
+            sa.text(
+                "SELECT 1 FROM information_schema.schemata WHERE schema_name = 'remote_server_schema'"
+            )
+        ).first()
+        if not schema_exists:
+            session.execute(sa.text("CREATE SCHEMA remote_server_schema"))
+            session.execute(
+                sa.text("IMPORT FOREIGN SCHEMA public FROM SERVER remote_server INTO remote_server_schema")
+            )
 
         session.commit()
 
@@ -241,6 +285,26 @@ def make_diff_patch(engine) -> str:
 
     commands.append("COMMIT;")
     return "\n".join(commands)
+
+
+def apply_patch_file(patch_path: str | Path, connection: DBConnection) -> None:
+    """Apply a patch file (as produced by make_diff_patch) to a database.
+
+    The file is a self-contained BEGIN;...COMMIT; script, so it's run as one
+    statement on an autocommit connection rather than through a session that
+    would try to manage its own transaction around it.
+    """
+    patch_sql = Path(patch_path).read_text()
+
+    engine = setup_engine(
+        connection.host,
+        connection.port,
+        connection.dbname,
+        connection.username,
+        connection.password
+    )
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        conn.execute(sa.text(patch_sql))
 
 
 def _build_table_graph(engine) -> DiGraph:
