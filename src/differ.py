@@ -1,9 +1,10 @@
+import sys
 from copy import copy
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
-from networkx import DiGraph, is_directed_acyclic_graph, topological_sort
+from networkx import DiGraph, find_cycle, is_directed_acyclic_graph, topological_sort
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.compiler import SQLCompiler
@@ -113,9 +114,23 @@ def link_dbs(local: DBConnection, remote: DBConnection):
         session.commit()
 
 
+class NoPrimaryKeyError(Exception):
+    """Raised when a table has no primary key, so it can't be safely diffed."""
+
+
 def get_table_keys(table: sa.Table) -> list[sa.Column]:
     """Given a table return the primary key columns from that table."""
     return [column for column in table.c if column.primary_key]
+
+
+def _require_primary_key(table: sa.Table) -> list[sa.Column]:
+    """Like get_table_keys, but fails loudly and clearly instead of letting
+    callers build a SELECT with zero columns (a confusing SQLAlchemy error
+    that also aborts the caller's whole run, not just this table)."""
+    keys = get_table_keys(table)
+    if not keys:
+        raise NoPrimaryKeyError(f"Table '{table.name}' has no primary key - it can't be safely diffed.")
+    return keys
 
 
 def print_stmt(stmt) -> None:
@@ -125,14 +140,9 @@ def print_stmt(stmt) -> None:
 
 def check_deletions(engine: sa.Engine, local_table: sa.Table, remote_table: sa.Table) -> list[DatabaseOperation]:
     """Find the deletion between tables."""
-    local_keys = [
-        getattr(local_table.c, table_key.name)
-        for table_key in get_table_keys(local_table)
-    ]
-    remote_keys = [
-        getattr(remote_table.c, table_key.name)
-        for table_key in get_table_keys(local_table)
-    ] 
+    table_keys = _require_primary_key(local_table)
+    local_keys = [getattr(local_table.c, table_key.name) for table_key in table_keys]
+    remote_keys = [getattr(remote_table.c, table_key.name) for table_key in table_keys]
     
     # Deleted are fields in the remote but not in the local db
     with Session(engine) as session:
@@ -158,14 +168,9 @@ def check_deletions(engine: sa.Engine, local_table: sa.Table, remote_table: sa.T
 
 def check_insertions(engine, local_table, remote_table) -> list[DatabaseOperation]:
     """Find the insertions between tables."""
-    local_keys = [
-        getattr(local_table.c, table_key.name)
-        for table_key in get_table_keys(local_table)
-    ]
-    remote_keys = [
-        getattr(remote_table.c, table_key.name)
-        for table_key in get_table_keys(local_table)
-    ] 
+    table_keys = _require_primary_key(local_table)
+    local_keys = [getattr(local_table.c, table_key.name) for table_key in table_keys]
+    remote_keys = [getattr(remote_table.c, table_key.name) for table_key in table_keys]
     
     with Session(engine) as session:
         stmt = sa.select(*local_keys).except_(sa.select(*remote_keys))
@@ -196,7 +201,7 @@ def check_insertions(engine, local_table, remote_table) -> list[DatabaseOperatio
 
 
 def check_updates(engine, local_table: sa.Table, remote_table: sa.Table) -> list[DatabaseOperation]:
-    key_columns = get_table_keys(local_table)
+    key_columns = _require_primary_key(local_table)
     key_names = {c.name for c in key_columns}
     key_indices = [index for index, column in enumerate(local_table.c) if column.name in key_names]
 
@@ -267,6 +272,23 @@ def make_all_checks(engine, local_table, remote_table) -> list[DatabaseOperation
     ]
 
 
+def _no_primary_key_warning(table_names: list[str]) -> str:
+    """A warning loud enough to notice both on the terminal (stderr) and in
+    the patch file itself, since whoever applies the patch later may not be
+    the person who generated it."""
+    border = "-- " + "!" * 70
+    lines = [
+        border,
+        "-- WARNING: the following tables have NO PRIMARY KEY and were SKIPPED.",
+        "-- They are NOT reflected in this patch at all - review them manually.",
+        *(f"--   - {name}" for name in table_names),
+        border,
+    ]
+    warning = "\n".join(lines)
+    print(warning, file=sys.stderr)
+    return warning
+
+
 def make_diff_patch(engine) -> str:
 
     commands = []
@@ -274,8 +296,19 @@ def make_diff_patch(engine) -> str:
 
     table_pairs = get_tables(engine)
 
-    all_ops = []
+    diffable_pairs = []
+    skipped_tables = []
     for table_pair in table_pairs:
+        if get_table_keys(table_pair.clone):
+            diffable_pairs.append(table_pair)
+        else:
+            skipped_tables.append(table_pair.clone.name)
+
+    if skipped_tables:
+        commands.append(_no_primary_key_warning(skipped_tables))
+
+    all_ops = []
+    for table_pair in diffable_pairs:
         all_ops.extend(make_all_checks(engine, table_pair.clone, table_pair.prod))
 
     graph = _build_table_graph(engine)
@@ -307,24 +340,36 @@ def apply_patch_file(patch_path: str | Path, connection: DBConnection) -> None:
         conn.execute(sa.text(patch_sql))
 
 
+class CyclicForeignKeysError(Exception):
+    """Raised when foreign keys form a cycle across multiple distinct
+    tables, so no single table-level insert order is possible."""
+
+
 def _build_table_graph(engine) -> DiGraph:
     """Create a Directed graph of the table relations in the database.
 
     Each edge points from a table to the table its foreign key references,
     e.g. orders -> users. This means a plain topological sort of the graph
     yields a child-before-parent order.
+
+    Self-referencing FKs (e.g. employees.manager_id -> employees.id) are not
+    represented as edges: "employees before employees" isn't a real
+    inter-table ordering constraint, and networkx treats any self-loop as a
+    cycle, which would otherwise block sorting the *entire* graph over a
+    single self-referencing table. Row-level ordering within such a table's
+    own inserts/deletes is a separate concern sort_ops doesn't handle yet.
     """
     metadata = sa.MetaData()
     metadata.reflect(bind=engine)
 
     graph = DiGraph()
     for table_name, table_obj in metadata.tables.items():
-        if not table_obj.foreign_keys:
-            graph.add_node(table_name)
-            continue
-
+        graph.add_node(table_name)
         for fk_constraint in table_obj.foreign_keys:
-            graph.add_edge(table_name, fk_constraint.column.table.name)
+            referenced_table = fk_constraint.column.table.name
+            if referenced_table == table_name:
+                continue
+            graph.add_edge(table_name, referenced_table)
 
     return graph
 
@@ -332,7 +377,13 @@ def _build_table_graph(engine) -> DiGraph:
 def _topological_table_sort(graph) -> list[str]:
     """Return tables in parent-before-child order, safe for inserts."""
     if not is_directed_acyclic_graph(graph):
-        raise Exception("Graph is not Directed and acyclical, can't be sorted.")
+        cycle_edges = find_cycle(graph)
+        cycle_tables = [u for u, v in cycle_edges] + [cycle_edges[0][0]]
+        raise CyclicForeignKeysError(
+            "Foreign keys form a cycle across multiple tables, so no single insert "
+            "order is possible: " + " -> ".join(cycle_tables) + ". This needs deferred "
+            "constraints or a two-phase insert, which isn't supported."
+        )
     tps = topological_sort(graph)
     return list(reversed(list(tps)))
 

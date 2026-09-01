@@ -4,17 +4,47 @@ Computes an FK-safe SQL patch between two Postgres databases, and (for GCP)
 a `db-differ` CLI that branches a database on a Cloud SQL instance, diffs
 the branch, and applies the resulting patch to a target database.
 
-## Manual FDW link (what `link_dbs` automates)
+## Quick Start
 
-```sql
--- Link database 1 into database 2 usinf postgres_fdw extension
-\c database2;
+Real, runnable example against project `testproject-235011`, using the
+throwaway test password `MyTestPassword123!` that `create_test_instance.sh`
+sets - swap in your own project id and password if you're setting this up
+fresh. Full explanation of every step (why, prerequisites, troubleshooting)
+is in "Verifying the toolset against a real GCP project" below.
 
-CREATE EXTENSION IF NOT EXISTS postgres_fdw;
-CREATE SERVER remote_server foreign data wrapper postgres_fdw options (host 'localhost', port '5432', dbname 'database1');
-CREATE USER MAPPING FOR user SERVER remote_server OPTIONS (user 'user');
-CREATE SCHEMA remote_server_schema;
-IMPORT FOREIGN SCHEMA public from server remote_server into remote_server_schema;
+```sh
+uv sync
+
+# one-time per project/network
+./scripts/enable_private_services_access.sh
+./scripts/create_test_instance.sh source-test-instance
+./scripts/seed_database.sh source-test-instance postgres postgres "MyTestPassword123!"
+
+# branch -> edit -> diff
+uv run db-differ branch create smoke-test \
+  --project testproject-235011 --instance source-test-instance \
+  --source-database postgres --username postgres --password "MyTestPassword123!"
+
+./scripts/connect_psql.sh source-test-instance smoke_test_modify postgres "MyTestPassword123!"
+# => DELETE FROM some_table WHERE id = 1;
+
+uv run db-differ diff smoke-test \
+  --project testproject-235011 --instance source-test-instance \
+  --username postgres --password "MyTestPassword123!" \
+  -o patch.sql
+
+# apply back onto postgres on source-test-instance - the database
+# smoke_test_base/modify were cloned from, so this is effectively "prod"
+cloud-sql-proxy --port 5434 testproject-235011:us-central1:source-test-instance &
+uv run db-differ apply patch.sql \
+  --host 127.0.0.1 --port 5434 \
+  --username postgres --dbname postgres --password "MyTestPassword123!"
+
+# clean up
+uv run db-differ branch drop smoke-test \
+  --project testproject-235011 --instance source-test-instance \
+  --username postgres --password "MyTestPassword123!"
+./scripts/delete_test_instance.sh source-test-instance
 ```
 
 ## Scripts
@@ -45,16 +75,6 @@ All of them act on whatever project your `gcloud` config currently points
 at - run `gcloud config set project YOUR_PROJECT` first if needed.
 `seed_database.sh` and `connect_psql.sh` also need the `cloud-sql-proxy`
 binary on `PATH`, and both stop their tunnel automatically when they exit.
-
-Typical order for a fresh project:
-
-```sh
-./scripts/enable_private_services_access.sh          # once per network
-./scripts/create_test_instance.sh source-test-instance
-./scripts/seed_database.sh source-test-instance postgres postgres "<password>"
-./scripts/connect_psql.sh source-test-instance postgres postgres "<password>" # whenever you want to poke at it by hand
-./scripts/delete_test_instance.sh source-test-instance # when you're done
-```
 
 ## Verifying the toolset against a real GCP project
 
@@ -156,21 +176,27 @@ uv run db-differ diff smoke-test \
 Inspect `patch.sql` - it should be a `BEGIN; ... COMMIT;` script containing
 just the delete (or whatever you changed), in FK-safe order.
 
-### 5. Apply the patch to a disposable target
+### 5. Apply the patch back to `postgres`
 
-**Don't point this at real prod on a first run.** Create one more scratch
-instance (or reuse any disposable database you don't mind mutating) to
-play the role of "prod" for this test, tunnel to it, and apply - `apply` is
-fully standalone and doesn't care whether the target is on GCP at all:
+`smoke_test_base`/`smoke_test_modify` were cloned from `postgres` on
+`SOURCE`, so applying the patch back to `postgres` there is effectively
+"promoting" the edit you made on `modify` back into the database it came
+from - `apply` is fully standalone and doesn't care whether the target is
+on GCP at all, so it just needs its own tunnel:
 
 ```sh
-cloud-sql-proxy --port 5434 YOUR_PROJECT:REGION:some-disposable-instance &
+cloud-sql-proxy --port 5434 YOUR_PROJECT:us-central1:source-test-instance &
 uv run db-differ apply patch.sql \
   --host 127.0.0.1 --port 5434 \
-  --username YOUR_USER --dbname YOUR_DB
+  --username postgres --dbname postgres --password "<password>"
 ```
 
-Then check the target database directly and confirm it now matches
+(`us-central1` because that's the fixed region `create_test_instance.sh`
+always uses - adjust if `SOURCE` lives elsewhere. Point `--host`/`--dbname`
+at a different, truly disposable target instead if you'd rather not mutate
+`SOURCE`'s own `postgres` database.)
+
+Then check `postgres` on `SOURCE` directly and confirm it now matches
 `modify`'s state for the table(s) you touched.
 
 ### 6. Clean up
@@ -180,12 +206,27 @@ uv run db-differ branch drop smoke-test --project YOUR_PROJECT --instance source
 ```
 
 drops `smoke_test_base`/`smoke_test_modify` (fast - they're just
-databases). It doesn't touch `SOURCE` itself or the scratch "prod" instance
-from step 5 - delete those too once you're done with the whole run:
+databases). It doesn't touch `SOURCE` itself - delete that too once you're
+done with the whole run:
 
 ```sh
 ./scripts/delete_test_instance.sh source-test-instance
-./scripts/delete_test_instance.sh some-disposable-instance
 ```
 
 and stop any `cloud-sql-proxy` processes you started by hand.
+
+## Internals: manual FDW link (what `link_dbs` automates)
+
+```sql
+-- Link database 1 into database 2 usinf postgres_fdw extension
+\c database2;
+
+CREATE EXTENSION IF NOT EXISTS postgres_fdw;
+CREATE SERVER remote_server foreign data wrapper postgres_fdw options (host 'localhost', port '5432', dbname 'database1');
+-- the password option is required for non-superusers (Cloud SQL's own
+-- "postgres" role isn't a true superuser there) - link_dbs includes it
+-- automatically whenever the remote connection has a password.
+CREATE USER MAPPING FOR user SERVER remote_server OPTIONS (user 'user', password 'password');
+CREATE SCHEMA remote_server_schema;
+IMPORT FOREIGN SCHEMA public from server remote_server into remote_server_schema;
+```

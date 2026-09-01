@@ -2,16 +2,19 @@
 import uuid
 from datetime import datetime
 
+from networkx import DiGraph
 from pytest_postgresql import factories
 import sqlalchemy as sa
-from pytest import fixture
+from pytest import fixture, raises
 from sqlalchemy import UUID, Column, DateTime, ForeignKey, Integer, MetaData, String, Table, text
 from sqlalchemy.orm import Session
 
 from src.db_engine import setup_engine
 from src.differ import (
+    CyclicForeignKeysError,
     DBConnection,
     DatabaseOperation,
+    NoPrimaryKeyError,
     OperationType,
     _build_table_graph,
     _topological_table_sort,
@@ -161,6 +164,26 @@ def _populate_db(engine):
         # Column(not a pk),
     )
 
+    # self-referencing FK: manager_id -> employees.id. A table-level
+    # topological sort has nothing meaningful to say about "employees
+    # before employees" - this exists to prove such a table doesn't block
+    # sorting the rest of the graph.
+    employees = Table(
+        "employees",
+        metadata,
+        Column("id", Integer, primary_key=True),
+        Column("name", String),
+        Column("manager_id", Integer, ForeignKey("employees.id"), nullable=True),
+        extend_existing=True
+    )
+
+    table_without_pk = Table(
+        "table_without_pk",
+        metadata,
+        Column("value", Integer),
+        extend_existing=True
+    )
+
     metadata.create_all(engine)
 
     with Session(engine) as session:
@@ -187,7 +210,14 @@ def _populate_db(engine):
         ]
         pk_insert = [dict(pk1=c1, pk2=c2, c1=c3, c2=c4, c3=c5) for c1, c2, c3, c4, c5 in pk_test_data]
         session.execute(sa.insert(table_with_multiple_pks), pk_insert)
-        session.commit() 
+        session.commit()
+
+        session.execute(sa.insert(table_without_pk), [dict(value=1), dict(value=2)])
+        session.commit()
+
+        session.execute(employees.insert().values(id=1, name="Root Manager", manager_id=None))
+        session.execute(employees.insert().values(id=2, name="Report", manager_id=1))
+        session.commit()
 
         
 # db = factories.postgresql('postgresql_noproc')
@@ -776,6 +806,18 @@ def test_table_graph_edges(setup_database_local):
     assert 'table_with_multiple_pks' in graph.nodes
 
 
+def test_table_graph_excludes_self_referencing_edges(setup_database_local):
+    """A self-referencing FK (employees.manager_id -> employees.id) is not a
+    real inter-table ordering constraint, and networkx treats any self-loop
+    as a cycle - it must not appear as an edge, or it would block sorting
+    the entire graph over this one table."""
+    engine = setup_database_local
+    graph = _build_table_graph(engine)
+
+    assert ('employees', 'employees') not in graph.edges
+    assert 'employees' in graph.nodes
+
+
 def test_topological_table_sort_is_parent_first(setup_database_local):
     """_topological_table_sort must place every parent before its children."""
     engine = setup_database_local
@@ -788,6 +830,21 @@ def test_topological_table_sort_is_parent_first(setup_database_local):
     assert rank['publishers'] < rank['authors'] < rank['editions']
     assert rank['countries'] < rank['regions'] < rank['cities'] < rank['warehouses'] < rank['shipments']
     assert rank['carriers'] < rank['shipments']
+    # a self-referencing table doesn't block sorting the rest of the graph,
+    # and is present in the resulting order like any other table
+    assert 'employees' in rank
+
+
+def test_topological_table_sort_raises_clear_error_for_multi_table_cycle():
+    """A genuine cycle across distinct tables (not a self-loop) has no
+    valid single insert order - this must fail with a message naming the
+    tables involved, not the previous generic 'can't be sorted' exception."""
+    graph = DiGraph()
+    graph.add_edge('a', 'b')
+    graph.add_edge('b', 'a')
+
+    with raises(CyclicForeignKeysError, match="a.*b.*a|b.*a.*b"):
+        _topological_table_sort(graph)
 
 
 def test_sort_ops_inserts_before_updates_before_deletes():
@@ -999,3 +1056,67 @@ def test_apply_patch_file(
         remaining = session.execute(sa.select(users_table.c.id)).scalars().all()
 
     assert sorted(remaining) == [1, 2, 3, 4, 5, 6, 7]
+
+
+def test_check_functions_raise_for_table_without_pk(
+    setup_database_local,
+    linked_databases,
+):
+    """check_deletions/insertions/updates must fail clearly - not with a
+    cryptic zero-column SELECT error - when a table has no primary key."""
+    engine = setup_database_local
+
+    table_pairs = get_tables(engine)
+    pair = _get_table_pair(table_pairs, 'table_without_pk')
+
+    for check in (check_deletions, check_insertions, check_updates):
+        with raises(NoPrimaryKeyError, match="table_without_pk"):
+            check(engine, pair.clone, pair.prod)
+
+
+def test_make_diff_patch_skips_table_without_pk_and_warns(
+    setup_database_local,
+    linked_databases,
+):
+    """A table with no primary key must not abort the whole diff run - it
+    gets skipped, with a visible warning in the patch, while every other
+    table is still diffed normally."""
+    engine = setup_database_local
+
+    metadata = MetaData()
+    metadata.reflect(bind=engine)
+    users_table = metadata.tables['users']
+
+    with Session(engine) as session:
+        session.execute(users_table.delete().where(users_table.c.id > 7))
+        session.commit()
+
+    diff_patch = make_diff_patch(engine)
+
+    assert 'table_without_pk' in diff_patch
+    assert 'WARNING' in diff_patch
+    assert 3 == len([sql for sql in diff_patch.split('\n') if 'public.users' in sql and 'DELETE' in sql])
+
+
+def test_make_diff_patch_works_with_self_referencing_table(
+    setup_database_local,
+    linked_databases,
+):
+    """A self-referencing table anywhere in the schema must not abort the
+    whole diff run - both it and every other table are diffed normally."""
+    engine = setup_database_local
+
+    metadata = MetaData()
+    metadata.reflect(bind=engine)
+    users_table = metadata.tables['users']
+    employees_table = metadata.tables['employees']
+
+    with Session(engine) as session:
+        session.execute(users_table.delete().where(users_table.c.id > 7))
+        session.execute(employees_table.insert().values(id=3, name="New Hire", manager_id=1))
+        session.commit()
+
+    diff_patch = make_diff_patch(engine)
+
+    assert 3 == len([sql for sql in diff_patch.split('\n') if 'public.users' in sql and 'DELETE' in sql])
+    assert 1 == len([sql for sql in diff_patch.split('\n') if 'public.employees' in sql and 'INSERT' in sql])
