@@ -5,11 +5,8 @@
 # create_test_instance.sh), non-interactively. Stops the proxy when done.
 #
 # Usage: ./scripts/seed_database.sh [INSTANCE_NAME] [DBNAME] [DBUSER] [PASSWORD] [PORT] [SQL_FILE]
-# PORT defaults to a freshly picked free port, not a fixed one, so a
-# leftover proxy from an earlier run can't make this one silently connect
-# to the wrong (stale) tunnel. If PASSWORD is omitted, psql falls back to
-# its own prompt/.pgpass - which needs a real interactive tty to work; pass
-# PASSWORD explicitly if that fails with "fe_sendauth: no password supplied".
+# If PASSWORD is omitted, psql prompts/.pgpass - needs a real tty. Pass it
+# explicitly on "fe_sendauth: no password supplied".
 
 set -euo pipefail
 
@@ -25,9 +22,7 @@ SQL_FILE=${6:-"${SCRIPT_DIR}/../seed.sql"}
 
 open_tunnel "${INSTANCE_NAME}" "${PORT}"
 
-# only set PGPASSWORD if PASSWORD was actually given - an empty PGPASSWORD
-# would override a working .pgpass/trust-auth fallback with an explicit
-# empty password instead of leaving it unset.
+# set only if given - an empty PGPASSWORD would override .pgpass/trust-auth
 if [[ -n "${PASSWORD}" ]]; then
     export PGPASSWORD="${PASSWORD}"
 fi

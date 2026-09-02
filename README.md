@@ -76,10 +76,28 @@ at - run `gcloud config set project YOUR_PROJECT` first if needed.
 `seed_database.sh` and `connect_psql.sh` also need the `cloud-sql-proxy`
 binary on `PATH`, and both stop their tunnel automatically when they exit.
 
+## Connecting without GCP
+
+`branch create`/`list`/`drop` and `diff` normally resolve connectivity
+through `--project`/`--instance` (Cloud SQL Admin API + Auth Proxy), but
+accept `--host`/`--port` instead - a direct connection to any already-
+reachable Postgres server, GCP or not. Exactly one pair must be given.
+`apply` has always worked this way; this makes all four operations
+consistent, and it's how `tests/test_cli_e2e.py` drives the real CLI
+against a disposable docker Postgres container for testing, without a real
+GCP project.
+
+For `diff` specifically, if the target's server-facing address differs
+from what the client connects through (e.g. a docker container's published
+port vs. its internal `5432`), pass `--server-host`/`--server-port` to
+override what `postgres_fdw`'s server-to-server hop should use - see
+`src/tunnel.py` for why `host`/`port` and `server_host`/`server_port` can
+differ.
+
 ## Verifying the toolset against a real GCP project
 
 The unit tests (`uv run pytest`) mock every GCP/Auth Proxy call for
-`gcp_admin.py`/`auth_proxy.py`, and exercise `branches.py`'s branch
+`gcp_admin.py`/`tunnel.py`, and exercise `branches.py`'s branch
 create/list/drop mechanism for real against local Postgres (via
 `pytest-postgresql`) - but none of that touches an actual Cloud SQL
 instance. Before relying on this against anything that matters, walk

@@ -13,15 +13,13 @@ from src.branches import (
 )
 from src.db_engine import setup_engine
 
-# dbname must be a safe Postgres identifier (no hyphens) since it's used
-# directly as a `source_database` value passed to create_branch.
+# dbname must be a safe Postgres identifier (no hyphens) - used as source_database.
 db = factories.postgresql("postgresql_noproc", dbname="branch_source")
 
 
 @pytest.fixture
 def admin_engine(db):
-    """Connected to template1, the way the CLI connects for branch ops -
-    never itself the thing being cloned."""
+    """Connected to template1, like the CLI does for branch ops."""
     return setup_engine(db.info.host, db.info.port, "template1", db.info.user)
 
 
@@ -77,10 +75,7 @@ def test_create_branch_rejects_unsafe_source_database_name(admin_engine):
 
 
 def test_create_branch_survives_a_lingering_connection_to_source(admin_engine, db, source_database):
-    """CREATE DATABASE ... TEMPLATE requires zero other connections to the
-    template - our own tooling (e.g. a stray connect_psql.sh session) is a
-    likely source of exactly that, so create_branch must terminate other
-    backends on the template first rather than erroring out."""
+    """create_branch must terminate other backends on the template first."""
     other_engine = setup_engine(db.info.host, db.info.port, source_database, db.info.user)
     lingering_conn = other_engine.connect()
     try:
@@ -89,14 +84,10 @@ def test_create_branch_survives_a_lingering_connection_to_source(admin_engine, d
 
         assert info.base_database == "feature_lingering_base"
     finally:
-        # create_branch is expected to have forcibly killed this connection
-        # server-side (that's the point of the test) - invalidate() discards
-        # it without trying a graceful rollback on a connection that's
-        # already gone.
+        # connection was force-killed server-side; invalidate() skips a
+        # graceful rollback on a connection that's already gone
         lingering_conn.invalidate()
         other_engine.dispose()
-        # unconditional, so a failure above can't leave the branch behind
-        # for the next test run to trip over
         drop_branch(admin_engine, "feature-lingering")
 
 

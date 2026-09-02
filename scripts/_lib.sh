@@ -7,10 +7,8 @@ require_cloud_sql_proxy() {
     fi
 }
 
-# Picks a free local port. Used as the default PORT in scripts that tunnel
-# through the Auth Proxy, so a leftover proxy process from an earlier run
-# squatting on a hardcoded port can't make a new run silently connect to the
-# wrong (stale) tunnel instead of failing loudly.
+# Picks a free local port. Avoids colliding with a leftover proxy from an
+# earlier run.
 _free_port() {
     python3 - <<'PYEOF'
 import socket
@@ -34,12 +32,8 @@ open_tunnel() {
     connection_name=$(gcloud sql instances describe "${instance_name}" --format="value(connectionName)")
     echo "Tunneling to ${connection_name} on 127.0.0.1:${port}..." >&2
 
-    # No --private-ip: instances here have both public and private IP
-    # (private for the base<->modify postgres_fdw hop, public so a machine
-    # outside the VPC - like the one running this script - can reach them
-    # at all). --private-ip would make the proxy dial the private IP,
-    # which typically isn't routable from outside the VPC in the first
-    # place (a dial timeout, not an auth/config error, is the symptom).
+    # No --private-ip: dial the public IP, which is reachable from outside
+    # the VPC (the private IP typically isn't).
     cloud-sql-proxy --port "${port}" "${connection_name}" &
     PROXY_PID=$!
 

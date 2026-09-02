@@ -1,8 +1,6 @@
-"""Manages the Cloud SQL Auth Proxy as a subprocess.
-
-The proxy binary (https://github.com/GoogleCloudSQL/cloud-sql-proxy) is
-expected to already be installed and on PATH - this module does not
-download or manage the binary itself.
+"""Context manager contract for a live database connection, plus its two
+production implementations. A third, test-only implementation
+(DockerPostgresTunnel) is in tests/docker_postgres.py.
 """
 
 import shutil
@@ -11,16 +9,51 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
+from typing import Protocol
 
 from src.gcp_admin import InstanceInfo
 
 _BINARY = "cloud-sql-proxy"
 _STARTUP_TIMEOUT = 30
 _STARTUP_POLL_INTERVAL = 0.5
+_POSTGRES_PORT = 5432
+
+
+class DatabaseTunnel(Protocol):
+    """host/port: client address. server_host/server_port: address the
+    database server uses to reach itself. Read-only properties, not plain
+    fields - AuthProxyTunnel.server_host is computed."""
+
+    host: str
+    port: int
+
+    @property
+    def server_host(self) -> str: ...
+    @property
+    def server_port(self) -> int: ...
+
+    def __enter__(self) -> "DatabaseTunnel": ...
+    def __exit__(self, exc_type, exc, tb) -> None: ...
+
+
+class DirectTunnel:
+    """No-op tunnel for a Postgres server reachable directly at host/port."""
+
+    def __init__(self, host: str, port: int, server_host: str | None = None, server_port: int | None = None):
+        self.host = host
+        self.port = port
+        self.server_host = server_host if server_host is not None else host
+        self.server_port = server_port if server_port is not None else port
+
+    def __enter__(self) -> "DirectTunnel":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        pass
 
 
 class AuthProxyError(Exception):
-    """Raised when the proxy binary is missing or fails to come up."""
+    """Raised when the proxy binary is missing or fails to start."""
 
 
 def _free_port() -> int:
@@ -36,12 +69,10 @@ def _port_is_open(host: str, port: int) -> bool:
 
 
 class AuthProxyTunnel:
-    """Context manager that tunnels 127.0.0.1:<port> to a Cloud SQL instance.
+    """Tunnels 127.0.0.1:<port> to a Cloud SQL instance via cloud-sql-proxy.
+    The binary must be on PATH."""
 
-    Usage:
-        with AuthProxyTunnel(project, instance_info) as tunnel:
-            engine = setup_engine(tunnel.host, tunnel.port, ...)
-    """
+    server_port = _POSTGRES_PORT
 
     def __init__(self, project: str, instance: InstanceInfo, port: int | None = None):
         self.project = project
@@ -50,6 +81,16 @@ class AuthProxyTunnel:
         self.port = port or _free_port()
         self._process: subprocess.Popen | None = None
         self._log_file = None
+
+    @property
+    def server_host(self) -> str:
+        if not self.instance.private_ip:
+            raise AuthProxyError(
+                f"Instance '{self.instance.name}' has no private IP. postgres_fdw needs "
+                "one for its server-to-server hop, even between two databases on the same "
+                "instance - Cloud SQL rejects a loopback connection there outright."
+            )
+        return self.instance.private_ip
 
     def __enter__(self) -> "AuthProxyTunnel":
         if shutil.which(_BINARY) is None:

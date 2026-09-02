@@ -22,11 +22,7 @@ class DBConnection:
 
 @dataclass
 class DBPair:
-    """This is the pair of databases to be connected.
-    
-    local is the database where the script operates, the one with the changes.
-    remote is the original database, the one the diff needs to computed upon and eventually applied. 
-    """
+    """local: database with the changes. remote: original database."""
     local: DBConnection
     remote: DBConnection
 
@@ -45,12 +41,7 @@ class DatabaseOperation:
 
 
 def link_dbs(local: DBConnection, remote: DBConnection):
-    """Link the local db to the remote one via postgres_fdw.
-
-    Idempotent: safe to call repeatedly against the same pair (e.g. running
-    `diff` more than once against the same branch) - each step is skipped if
-    it was already done by a previous call.
-    """
+    """Link the local db to the remote one via postgres_fdw. Idempotent."""
     local_engine = setup_engine(
         local.host,
         local.port,
@@ -59,6 +50,13 @@ def link_dbs(local: DBConnection, remote: DBConnection):
         local.password
     )
 
+    try:
+        _link_dbs_with_engine(local_engine, remote)
+    finally:
+        local_engine.dispose()
+
+
+def _link_dbs_with_engine(local_engine, remote: DBConnection) -> None:
     with Session(local_engine) as session:
 
         session.execute(sa.text("CREATE EXTENSION IF NOT EXISTS postgres_fdw"))
@@ -82,10 +80,8 @@ def link_dbs(local: DBConnection, remote: DBConnection):
             )
         ).first()
         if not mapping_exists:
-            # Postgres requires the password in the mapping for non-superusers
-            # (Cloud SQL's own "postgres" role isn't a true superuser there),
-            # otherwise CREATE SERVER/IMPORT FOREIGN SCHEMA later fails with
-            # "password is required".
+            # Password required for non-superusers, else later steps fail
+            # with "password is required".
             if remote.password:
                 session.execute(
                     sa.text(
@@ -124,9 +120,8 @@ def get_table_keys(table: sa.Table) -> list[sa.Column]:
 
 
 def _require_primary_key(table: sa.Table) -> list[sa.Column]:
-    """Like get_table_keys, but fails loudly and clearly instead of letting
-    callers build a SELECT with zero columns (a confusing SQLAlchemy error
-    that also aborts the caller's whole run, not just this table)."""
+    """Like get_table_keys, but raises a clear error instead of a SELECT
+    with zero columns."""
     keys = get_table_keys(table)
     if not keys:
         raise NoPrimaryKeyError(f"Table '{table.name}' has no primary key - it can't be safely diffed.")
@@ -143,10 +138,9 @@ def check_deletions(engine: sa.Engine, local_table: sa.Table, remote_table: sa.T
     table_keys = _require_primary_key(local_table)
     local_keys = [getattr(local_table.c, table_key.name) for table_key in table_keys]
     remote_keys = [getattr(remote_table.c, table_key.name) for table_key in table_keys]
-    
-    # Deleted are fields in the remote but not in the local db
+
     with Session(engine) as session:
-        # Returns all ids in the remote that are not in the local. They were deleted.
+        # keys in remote but not local = deleted
         stmt = sa.select(*remote_keys).except_(sa.select(*local_keys))
         deleted_rows = session.execute(stmt).all()
 
@@ -215,14 +209,13 @@ def check_updates(engine, local_table: sa.Table, remote_table: sa.Table) -> list
         stmt = sa.select(local_table).except_(sa.select(remote_table))
         local_exclusive = session.execute(stmt).all()
 
-        # If a row's key is shared by both sides then it's modified, not inserted/deleted
+        # key shared by both sides = modified row
         shared_keys = {row_key(r) for r in remote_exclusive} & {row_key(r) for r in local_exclusive}
 
         update_list = []
         for key_values in shared_keys:
             local_row = next(r for r in local_exclusive if row_key(r) == key_values)
             remote_row = next(r for r in remote_exclusive if row_key(r) == key_values)
-            ## Compare field by field to get the differences and construct the sql update
             changed = {}
             for column, remote_field, local_field in zip(local_table.c, remote_row, local_row):
                 if column.name in key_names:
@@ -273,9 +266,7 @@ def make_all_checks(engine, local_table, remote_table) -> list[DatabaseOperation
 
 
 def _no_primary_key_warning(table_names: list[str]) -> str:
-    """A warning loud enough to notice both on the terminal (stderr) and in
-    the patch file itself, since whoever applies the patch later may not be
-    the person who generated it."""
+    """Printed to stderr and embedded in the patch file."""
     border = "-- " + "!" * 70
     lines = [
         border,
@@ -322,11 +313,7 @@ def make_diff_patch(engine) -> str:
 
 def apply_patch_file(patch_path: str | Path, connection: DBConnection) -> None:
     """Apply a patch file (as produced by make_diff_patch) to a database.
-
-    The file is a self-contained BEGIN;...COMMIT; script, so it's run as one
-    statement on an autocommit connection rather than through a session that
-    would try to manage its own transaction around it.
-    """
+    Runs as one autocommit script - the file has its own BEGIN;...COMMIT;."""
     patch_sql = Path(patch_path).read_text()
 
     engine = setup_engine(
@@ -336,8 +323,11 @@ def apply_patch_file(patch_path: str | Path, connection: DBConnection) -> None:
         connection.username,
         connection.password
     )
-    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
-        conn.execute(sa.text(patch_sql))
+    try:
+        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+            conn.execute(sa.text(patch_sql))
+    finally:
+        engine.dispose()
 
 
 class CyclicForeignKeysError(Exception):
@@ -346,19 +336,8 @@ class CyclicForeignKeysError(Exception):
 
 
 def _build_table_graph(engine) -> DiGraph:
-    """Create a Directed graph of the table relations in the database.
-
-    Each edge points from a table to the table its foreign key references,
-    e.g. orders -> users. This means a plain topological sort of the graph
-    yields a child-before-parent order.
-
-    Self-referencing FKs (e.g. employees.manager_id -> employees.id) are not
-    represented as edges: "employees before employees" isn't a real
-    inter-table ordering constraint, and networkx treats any self-loop as a
-    cycle, which would otherwise block sorting the *entire* graph over a
-    single self-referencing table. Row-level ordering within such a table's
-    own inserts/deletes is a separate concern sort_ops doesn't handle yet.
-    """
+    """Directed graph of FK relations: edge table -> referenced table.
+    Self-referencing FKs are excluded (would register as a cycle)."""
     metadata = sa.MetaData()
     metadata.reflect(bind=engine)
 
@@ -397,15 +376,8 @@ _OPERATION_PHASE = {
 
 def sort_ops(ops: list[DatabaseOperation], table_order: list[str]) -> list[DatabaseOperation]:
     """Order operations so applying them never violates a FK constraint.
-
-    table_order must be a parent-before-child table ordering (as returned by
-    _topological_table_sort). Operations are grouped into three phases:
-    inserts (parent-first, so referenced rows exist before their children),
-    updates (order doesn't matter - a changed FK value can only point at a
-    row that already exists or was just inserted in this same patch), and
-    deletes (child-first, so a row is removed before the parent it
-    references).
-    """
+    table_order: parent-before-child (see _topological_table_sort). Phases:
+    inserts (parent-first), updates (any order), deletes (child-first)."""
     table_rank = {table_name: rank for rank, table_name in enumerate(table_order)}
 
     def sort_key(op: DatabaseOperation):

@@ -164,10 +164,7 @@ def _populate_db(engine):
         # Column(not a pk),
     )
 
-    # self-referencing FK: manager_id -> employees.id. A table-level
-    # topological sort has nothing meaningful to say about "employees
-    # before employees" - this exists to prove such a table doesn't block
-    # sorting the rest of the graph.
+    # self-referencing FK: manager_id -> employees.id
     employees = Table(
         "employees",
         metadata,
@@ -556,14 +553,8 @@ def test_deletions_detect_partial_composite_key(
     setup_database_remote,
     linked_databases,
 ):
-    """A pk1-only key match misses a deletion when a sibling row shares pk1.
-
-    Two rows share pk1=1 (pk2=11 and pk2=999) in both local and remote.
-    Only the pk2=999 row is deleted locally; pk2=11 survives untouched.
-    An implementation keyed on the first PK column alone sees pk1=1 still
-    present in local (via the surviving pk2=11 row) and reports zero
-    deletions, silently missing the row that needs to be removed from prod.
-    """
+    """Deletion must use the full composite key, not just pk1 - two rows
+    share pk1=1 (pk2=11, pk2=999), only pk2=999 is deleted locally."""
     local_engine = setup_database_local
     remote_engine = setup_database_remote
 
@@ -610,12 +601,8 @@ def test_insertions_detect_multiple_keys(
     setup_database_local,
     linked_databases,
 ):
-    """check_insertions must key off every PK column, not just the first one.
-
-    This row shares pk1=1 with an existing remote row (pk1=1, pk2=11) and is
-    only distinguished by pk2=999. An implementation that diffs on pk1 alone
-    will see pk1=1 already present remotely and silently drop this insert.
-    """
+    """check_insertions must key off the full composite key - row shares
+    pk1=1 with an existing remote row, differs only by pk2=999."""
     engine = setup_database_local
 
     metadata = MetaData()
@@ -642,13 +629,8 @@ def test_check_updates_multiple_keys(
     setup_database_remote,
     linked_databases,
 ):
-    """check_updates must key off every PK column, not just the first one.
-
-    Two rows share pk1=1 (pk2=11 and pk2=999) in both local and remote, and
-    both get modified locally with different values. An implementation that
-    matches modified rows by pk1 alone collapses both rows onto a single id
-    (1) and only keeps one of the two updates, silently dropping the other.
-    """
+    """check_updates must key off the full composite key - two rows share
+    pk1=1 (pk2=11, pk2=999), both modified with different values."""
     local_engine = setup_database_local
     remote_engine = setup_database_remote
 
@@ -698,15 +680,7 @@ def test_fk_table_operations(
     setup_database_remote,
     linked_databases,
 ):
-    """Insert, update and delete detection on a table with foreign keys.
-
-    orders has FKs to users.id and books.book_uuid. Seed an identical
-    baseline of books + orders in both local and remote, then diverge
-    local with one insert, one update and one delete, and confirm all
-    three checks handle the FK-constrained table without violating
-    referential integrity (the new row's parent book is inserted first;
-    the deleted order's parent rows are left untouched).
-    """
+    """Insert, update, delete detection on orders (FKs to users, books)."""
     local_engine = setup_database_local
     remote_engine = setup_database_remote
 
@@ -807,10 +781,7 @@ def test_table_graph_edges(setup_database_local):
 
 
 def test_table_graph_excludes_self_referencing_edges(setup_database_local):
-    """A self-referencing FK (employees.manager_id -> employees.id) is not a
-    real inter-table ordering constraint, and networkx treats any self-loop
-    as a cycle - it must not appear as an edge, or it would block sorting
-    the entire graph over this one table."""
+    """employees.manager_id -> employees.id must not appear as an edge."""
     engine = setup_database_local
     graph = _build_table_graph(engine)
 
@@ -830,15 +801,11 @@ def test_topological_table_sort_is_parent_first(setup_database_local):
     assert rank['publishers'] < rank['authors'] < rank['editions']
     assert rank['countries'] < rank['regions'] < rank['cities'] < rank['warehouses'] < rank['shipments']
     assert rank['carriers'] < rank['shipments']
-    # a self-referencing table doesn't block sorting the rest of the graph,
-    # and is present in the resulting order like any other table
-    assert 'employees' in rank
+    assert 'employees' in rank  # self-referencing table is still sorted
 
 
 def test_topological_table_sort_raises_clear_error_for_multi_table_cycle():
-    """A genuine cycle across distinct tables (not a self-loop) has no
-    valid single insert order - this must fail with a message naming the
-    tables involved, not the previous generic 'can't be sorted' exception."""
+    """A cycle across distinct tables must raise, naming the tables."""
     graph = DiGraph()
     graph.add_edge('a', 'b')
     graph.add_edge('b', 'a')
@@ -848,9 +815,7 @@ def test_topological_table_sort_raises_clear_error_for_multi_table_cycle():
 
 
 def test_sort_ops_inserts_before_updates_before_deletes():
-    """Regardless of table, every insert must precede every update, which
-    must precede every delete - a changed/removed row can only safely
-    reference rows that already exist at that point in the patch."""
+    """All inserts precede all updates precede all deletes, regardless of table."""
     order = ['publishers', 'authors', 'editions']
     ops = [
         DatabaseOperation('editions', OperationType.DELETE, 'delete editions'),
@@ -895,12 +860,8 @@ def test_make_diff_patch_applies_without_fk_violation(
     setup_database_remote,
     linked_databases,
 ):
-    """The generated diff patch must apply to the remote DB without tripping
-    a FK constraint, exercising both insert (parent-first) and delete
-    (child-first) ordering across the publishers -> authors -> editions
-    chain: a brand new 3-deep chain is inserted while an existing one is
-    torn down in the same patch.
-    """
+    """Patch applies without an FK violation: a new publisher/author/edition
+    chain is inserted while an existing one is torn down, same patch."""
     local_engine = setup_database_local
     remote_engine = setup_database_remote
 
@@ -941,9 +902,7 @@ def test_make_diff_patch_applies_without_fk_violation(
 
     diff_patch = make_diff_patch(local_engine)
 
-    # applied as a single multi-statement script (its BEGIN/COMMIT manage the
-    # transaction), the way a real consumer would run it via psql or a raw
-    # autocommit connection - not through an ORM session's own transaction.
+    # run as one autocommit script - patch has its own BEGIN/COMMIT
     with remote_engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
         conn.execute(text(diff_patch))
 
@@ -963,9 +922,7 @@ def test_link_dbs_is_idempotent(
     db_local,
     db_remote,
 ):
-    """link_dbs must not error when called twice against the same pair, since
-    a real `diff` command needs to be re-runnable against the same branch as
-    someone edits the modify database."""
+    """link_dbs must not error when called twice against the same pair."""
     local = DBConnection(
         host=db_local.info.host,
         port=db_local.info.port,
@@ -989,10 +946,7 @@ def test_link_dbs_includes_password_in_user_mapping_when_given(
     db_local,
     db_remote,
 ):
-    """CREATE USER MAPPING must include the password option when the remote
-    connection has one - Postgres requires it for non-superusers (e.g. Cloud
-    SQL's own "postgres" role isn't a true superuser there), otherwise
-    CREATE SERVER/IMPORT FOREIGN SCHEMA fails with "password is required"."""
+    """CREATE USER MAPPING must include the password option when given."""
     local = DBConnection(
         host=db_local.info.host,
         port=db_local.info.port,
@@ -1062,8 +1016,7 @@ def test_check_functions_raise_for_table_without_pk(
     setup_database_local,
     linked_databases,
 ):
-    """check_deletions/insertions/updates must fail clearly - not with a
-    cryptic zero-column SELECT error - when a table has no primary key."""
+    """Must raise NoPrimaryKeyError, not a zero-column SELECT error."""
     engine = setup_database_local
 
     table_pairs = get_tables(engine)
@@ -1078,9 +1031,7 @@ def test_make_diff_patch_skips_table_without_pk_and_warns(
     setup_database_local,
     linked_databases,
 ):
-    """A table with no primary key must not abort the whole diff run - it
-    gets skipped, with a visible warning in the patch, while every other
-    table is still diffed normally."""
+    """No-PK table is skipped with a warning; other tables still diff."""
     engine = setup_database_local
 
     metadata = MetaData()
@@ -1102,8 +1053,7 @@ def test_make_diff_patch_works_with_self_referencing_table(
     setup_database_local,
     linked_databases,
 ):
-    """A self-referencing table anywhere in the schema must not abort the
-    whole diff run - both it and every other table are diffed normally."""
+    """A self-referencing table must not abort the diff run."""
     engine = setup_database_local
 
     metadata = MetaData()
