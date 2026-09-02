@@ -1,18 +1,10 @@
 #!/usr/bin/env bash
 #
-# Required once per network before create_test_instance.sh: Cloud SQL
-# rejects postgres_fdw connections to the loopback address, even for an
-# instance connecting to itself, so `diff`'s FDW hop needs a real private
-# IP even though base/modify are databases on one instance.
+# Required once per network before create_test_instance.sh. Reserves an IP
+# range for Google-managed services and peers it with the VPC - what makes
+# --network=... (private IP) work on `gcloud sql instances create`.
 #
-# One-time, per-network setup: reserves an IP range for Google-managed
-# services and peers it with your VPC, which is what makes `--network=...`
-# (private IP) work on `gcloud sql instances create`. Without this, that
-# command fails with an error telling you to do exactly this.
-#
-# Safe to re-run: skips the range reservation if it already exists, and
-# `gcloud services vpc-peerings connect` is itself safe to call again on an
-# already-connected network.
+# Safe to re-run.
 #
 # Usage: ./scripts/enable_private_services_access.sh [NETWORK]
 

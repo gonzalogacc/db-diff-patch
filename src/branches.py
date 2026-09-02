@@ -1,11 +1,8 @@
 """Branch orchestration at the database level.
 
-A branch is a pair of databases on the *same* Postgres server: `base` (a
-frozen clone of a source database, the comparison point) and `modify` (a
-clone of `base`, the working copy someone edits). This module knows nothing
-about GCP or the Auth Proxy - it just needs an Engine connected to some
-database on the target server (conventionally `template1`; see
-create_branch's docstring for why) and works purely in Postgres SQL.
+A branch is a pair of databases on the same Postgres server: `base` (a
+frozen clone of a source database) and `modify` (a clone of `base`, the
+working copy someone edits). GCP-agnostic - takes a plain Engine.
 """
 
 import re
@@ -67,15 +64,9 @@ def _terminate_backends(conn, database_name: str) -> None:
 
 
 def create_branch(engine: Engine, source_database: str, branch_name: str) -> BranchInfo:
-    """Create branch_name's base/modify databases on the server `engine`
-    connects to, by templating base off source_database and modify off base.
-
-    `engine` must be connected to a database other than source_database -
-    Postgres can't template a database off the one the current session is
-    connected to. Connecting to `template1` (guaranteed to exist, and never
-    itself the thing being cloned) is the intended usage - it works even
-    when source_database is the only other database on the server.
-    """
+    """Create base/modify by templating base off source_database and modify
+    off base. `engine` must connect to a database other than
+    source_database - use `template1`."""
     _validate_identifier(source_database, "source database")
     slug = _slugify(branch_name)
     base_name = _database_name(slug, "base")
@@ -123,8 +114,7 @@ def list_branches(engine: Engine) -> list[BranchInfo]:
         base = roles.get("base")
         modify = roles.get("modify")
         if base is None or modify is None:
-            # a branch mid create/drop, or one that was only partially cleaned up
-            continue
+            continue  # incomplete branch
         branches.append(
             BranchInfo(name=slug, base_database=base, modify_database=modify, source_database=sources.get(slug))
         )

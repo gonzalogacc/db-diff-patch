@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from click.testing import CliRunner
 
@@ -8,7 +8,7 @@ from src.cli import cli
 from src.gcp_admin import GCPAdminError, InstanceInfo
 
 
-def _instance(name, private_ip="10.0.0.1", public_ip="34.0.0.1"):
+def _instance(name, private_ip: str | None = "10.0.0.1", public_ip: str | None = "34.0.0.1"):
     return InstanceInfo(
         name=name, region="us-central1", database_version="POSTGRES_15",
         private_ip=private_ip, public_ip=public_ip, labels={},
@@ -16,19 +16,22 @@ def _instance(name, private_ip="10.0.0.1", public_ip="34.0.0.1"):
 
 
 def _patched_tunnel():
-    """Context manager for patching src.cli.get_instance/AuthProxyTunnel/
-    setup_engine the way every branch/diff command needs - yields the mock
-    tunnel class so callers can assert on it if needed."""
+    """Patches get_instance/AuthProxyTunnel/setup_engine for branch/diff
+    commands. Returns (patches, fake_engine); fake_engine is a MagicMock
+    since cli.py calls .dispose() on it."""
     fake_tunnel = SimpleNamespace(host="127.0.0.1", port=6543)
     patches = [
         patch("src.cli.get_instance", return_value=_instance("my-instance")),
         patch("src.cli.AuthProxyTunnel"),
-        patch("src.cli.setup_engine", return_value="fake-engine"),
+        patch("src.cli.setup_engine", return_value=MagicMock(name="fake-engine")),
     ]
-    _, mock_tunnel_cls, _ = (p.start() for p in patches)
+    _, mock_tunnel_cls, mock_setup_engine = (p.start() for p in patches)
     mock_tunnel_cls.return_value.__enter__.return_value = fake_tunnel
     mock_tunnel_cls.return_value.__exit__.return_value = False
-    return patches
+    # read pre-__enter__ by diff(), matching AuthProxyTunnel.server_host/port
+    mock_tunnel_cls.return_value.server_host = "10.0.0.1"
+    mock_tunnel_cls.return_value.server_port = 5432
+    return patches, mock_setup_engine.return_value
 
 
 def _stop(patches):
@@ -67,7 +70,7 @@ def test_branch_create_prints_created_branch():
     runner = CliRunner()
     info = BranchInfo(name="feature_x", base_database="feature_x_base", modify_database="feature_x_modify",
                        source_database="app")
-    patches = _patched_tunnel()
+    patches, fake_engine = _patched_tunnel()
     try:
         with patch("src.cli.create_branch", return_value=info) as mock_create:
             result = runner.invoke(cli, [
@@ -81,7 +84,7 @@ def test_branch_create_prints_created_branch():
         _stop(patches)
 
     assert result.exit_code == 0, result.output
-    mock_create.assert_called_once_with("fake-engine", "app", "Feature X")
+    mock_create.assert_called_once_with(fake_engine, "app", "Feature X")
     assert "feature_x_base" in result.output
     assert "feature_x_modify" in result.output
 
@@ -105,7 +108,7 @@ def test_branch_list_prints_branches():
     runner = CliRunner()
     info = BranchInfo(name="feature_x", base_database="feature_x_base", modify_database="feature_x_modify",
                        source_database="app")
-    patches = _patched_tunnel()
+    patches, _fake_engine = _patched_tunnel()
     try:
         with patch("src.cli.list_branches", return_value=[info]):
             result = runner.invoke(cli, [
@@ -123,7 +126,7 @@ def test_branch_list_prints_branches():
 
 def test_branch_drop_reports_error():
     runner = CliRunner()
-    patches = _patched_tunnel()
+    patches, _fake_engine = _patched_tunnel()
     try:
         with patch("src.cli.drop_branch", side_effect=BranchError("no branch named 'x'")):
             result = runner.invoke(cli, [
@@ -145,7 +148,7 @@ def test_diff_writes_patch_file(tmp_path):
                               source_database="app")
     output_path = tmp_path / "patch.sql"
 
-    patches = _patched_tunnel()
+    patches, _fake_engine = _patched_tunnel()
     try:
         with patch("src.cli.get_branch", return_value=branch_info), \
              patch("src.cli.link_dbs") as mock_link_dbs, \
@@ -166,10 +169,7 @@ def test_diff_writes_patch_file(tmp_path):
     local, remote = mock_link_dbs.call_args[0]
     assert local.dbname == "feature_x_modify"
     assert remote.dbname == "feature_x_base"
-    # Cloud SQL rejects postgres_fdw connecting to the loopback address,
-    # even for an instance connecting to itself - the FDW hop must target
-    # the instance's real private IP, not localhost.
-    assert remote.host == "10.0.0.1"
+    assert remote.host == "10.0.0.1"  # FDW hop uses the instance's private IP
 
 
 def test_diff_fails_without_instance_private_ip():
@@ -189,7 +189,7 @@ def test_diff_fails_without_instance_private_ip():
 
 def test_diff_reports_branch_not_found():
     runner = CliRunner()
-    patches = _patched_tunnel()
+    patches, _fake_engine = _patched_tunnel()
     try:
         with patch("src.cli.get_branch", side_effect=BranchError("No branch named 'x' found")):
             result = runner.invoke(cli, [

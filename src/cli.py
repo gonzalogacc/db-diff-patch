@@ -4,16 +4,15 @@ from pathlib import Path
 
 import click
 
-from src.auth_proxy import AuthProxyError, AuthProxyTunnel
 from src.branches import BranchError, create_branch, drop_branch, get_branch, list_branches
 from src.db_engine import setup_engine
 from src.differ import DBConnection, apply_patch_file, link_dbs, make_diff_patch
 from src.gcp_admin import GCPAdminError, get_instance, list_instances
+from src.tunnel import AuthProxyError, AuthProxyTunnel, DatabaseTunnel, DirectTunnel
 
 _POSTGRES_PORT = 5432
-# Every branch operation needs to connect to *some* database on the target
-# instance to run admin SQL (CREATE DATABASE, pg_database, ...). template1
-# is guaranteed to exist and is never itself a source/branch database.
+# DB to connect to for admin SQL (CREATE DATABASE, pg_database, ...).
+# Guaranteed to exist, never itself a source/branch database.
 _MAINTENANCE_DB = "template1"
 
 
@@ -49,10 +48,29 @@ def _resolve_instance(project, instance_name):
         raise click.ClickException(str(exc)) from exc
 
 
-def _open_tunnel(project, instance_name):
-    """Resolve `instance_name` and return an AuthProxyTunnel context manager
-    for it, so the caller can open a connection through it."""
-    return AuthProxyTunnel(project, _resolve_instance(project, instance_name))
+def _resolve_tunnel(project, instance, host, port, server_host=None, server_port=None) -> DatabaseTunnel:
+    """--project/--instance (GCP) or --host/--port (direct) - exactly one
+    pair required. server_host/server_port apply only to the direct path."""
+    gcp_given = bool(project or instance)
+    direct_given = bool(host or port)
+
+    if gcp_given and direct_given:
+        raise click.ClickException("Use either --project/--instance or --host/--port, not both.")
+    if direct_given:
+        if not (host and port):
+            raise click.ClickException("--host and --port must be given together.")
+        return DirectTunnel(host, port, server_host=server_host, server_port=server_port)
+    if gcp_given:
+        if not (project and instance):
+            raise click.ClickException("--project and --instance must be given together.")
+        return AuthProxyTunnel(project, _resolve_instance(project, instance))
+    raise click.ClickException("Provide either --project/--instance or --host/--port.")
+
+
+_project_option = click.option("--project", default=None, help="GCP project id (with --instance)")
+_instance_option = click.option("--instance", default=None, help="Cloud SQL instance the branch lives on (with --project)")
+_host_option = click.option("--host", default=None, help="Direct Postgres host (with --port) - alternative to --project/--instance")
+_port_option = click.option("--port", default=None, type=int, help="Direct Postgres port (with --host)")
 
 
 @cli.group("branch")
@@ -62,18 +80,23 @@ def branch_group():
 
 @branch_group.command("create")
 @click.argument("name")
-@click.option("--project", required=True, help="GCP project id")
-@click.option("--instance", required=True, help="Cloud SQL instance the branch lives on")
+@_project_option
+@_instance_option
+@_host_option
+@_port_option
 @click.option("--source-database", required=True, help="Database to clone base/modify from")
 @click.option("--username", required=True, help="Postgres user on that instance")
 @click.option("--password", default=None, help="Postgres password on that instance")
-def branch_create(name, project, instance, source_database, username, password):
+def branch_create(name, project, instance, host, port, source_database, username, password):
     """Create a branch: base = CREATE DATABASE TEMPLATE source, modify = CREATE DATABASE TEMPLATE base."""
-    tunnel = _open_tunnel(project, instance)
+    tunnel = _resolve_tunnel(project, instance, host, port)
     try:
         with tunnel as t:
             engine = setup_engine(t.host, t.port, _MAINTENANCE_DB, username, password)
-            info = create_branch(engine, source_database, name)
+            try:
+                info = create_branch(engine, source_database, name)
+            finally:
+                engine.dispose()
     except (AuthProxyError, BranchError) as exc:
         raise click.ClickException(str(exc)) from exc
 
@@ -81,17 +104,22 @@ def branch_create(name, project, instance, source_database, username, password):
 
 
 @branch_group.command("list")
-@click.option("--project", required=True, help="GCP project id")
-@click.option("--instance", required=True, help="Cloud SQL instance to look for branches on")
+@_project_option
+@_instance_option
+@_host_option
+@_port_option
 @click.option("--username", required=True, help="Postgres user on that instance")
 @click.option("--password", default=None, help="Postgres password on that instance")
-def branch_list(project, instance, username, password):
+def branch_list(project, instance, host, port, username, password):
     """List existing branches on an instance."""
-    tunnel = _open_tunnel(project, instance)
+    tunnel = _resolve_tunnel(project, instance, host, port)
     try:
         with tunnel as t:
             engine = setup_engine(t.host, t.port, _MAINTENANCE_DB, username, password)
-            branches = list_branches(engine)
+            try:
+                branches = list_branches(engine)
+            finally:
+                engine.dispose()
     except AuthProxyError as exc:
         raise click.ClickException(str(exc)) from exc
 
@@ -107,17 +135,22 @@ def branch_list(project, instance, username, password):
 
 @branch_group.command("drop")
 @click.argument("name")
-@click.option("--project", required=True, help="GCP project id")
-@click.option("--instance", required=True, help="Cloud SQL instance the branch lives on")
+@_project_option
+@_instance_option
+@_host_option
+@_port_option
 @click.option("--username", required=True, help="Postgres user on that instance")
 @click.option("--password", default=None, help="Postgres password on that instance")
-def branch_drop(name, project, instance, username, password):
+def branch_drop(name, project, instance, host, port, username, password):
     """Delete a branch's base and modify databases."""
-    tunnel = _open_tunnel(project, instance)
+    tunnel = _resolve_tunnel(project, instance, host, port)
     try:
         with tunnel as t:
             engine = setup_engine(t.host, t.port, _MAINTENANCE_DB, username, password)
-            drop_branch(engine, name)
+            try:
+                drop_branch(engine, name)
+            finally:
+                engine.dispose()
     except (AuthProxyError, BranchError) as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(f"Dropped branch '{name}'.")
@@ -125,25 +158,25 @@ def branch_drop(name, project, instance, username, password):
 
 @cli.command("diff")
 @click.argument("name")
-@click.option("--project", required=True, help="GCP project id")
-@click.option("--instance", required=True, help="Cloud SQL instance the branch lives on")
+@_project_option
+@_instance_option
+@_host_option
+@_port_option
+@click.option("--server-host", default=None, help="FDW hop address, if different from --host (e.g. docker). Defaults to --host")
+@click.option("--server-port", default=None, type=int, help="FDW hop port, if different from --port. Defaults to --port")
 @click.option("--username", required=True, help="Postgres user on that instance")
 @click.option("--password", default=None, help="Postgres password on that instance")
 @click.option("-o", "--output", "output_path", required=True, type=click.Path(), help="Where to write the patch file")
-def diff(name, project, instance, username, password, output_path):
+def diff(name, project, instance, host, port, server_host, server_port, username, password, output_path):
     """Compute the diff between a branch's base and modify databases and write it as a patch file."""
-    instance_info = _resolve_instance(project, instance)
-    if not instance_info.private_ip:
-        raise click.ClickException(
-            f"Instance '{instance}' has no private IP. base/modify are databases on this "
-            "same instance, but postgres_fdw still needs a real address for the hop between "
-            "them - Cloud SQL rejects a loopback/localhost connection outright "
-            "('connection to the loopback address is not allowed'). Recreate SOURCE with "
-            "a private IP (enable_private_services_access.sh, then create_test_instance.sh "
-            "--network)."
-        )
+    tunnel = _resolve_tunnel(project, instance, host, port, server_host, server_port)
+    try:
+        # Read before entering the tunnel, so a missing private IP fails
+        # fast without starting a proxy process.
+        resolved_server_host, resolved_server_port = tunnel.server_host, tunnel.server_port
+    except AuthProxyError as exc:
+        raise click.ClickException(str(exc)) from exc
 
-    tunnel = AuthProxyTunnel(project, instance_info)
     try:
         with tunnel as t:
             admin_engine = setup_engine(t.host, t.port, _MAINTENANCE_DB, username, password)
@@ -151,22 +184,26 @@ def diff(name, project, instance, username, password, output_path):
                 branch_info = get_branch(admin_engine, name)
             except BranchError as exc:
                 raise click.ClickException(str(exc)) from exc
+            finally:
+                admin_engine.dispose()
 
             local = DBConnection(
                 host=t.host, port=t.port, username=username,
                 dbname=branch_info.modify_database, password=password,
             )
-            # base and modify are databases on the same server, but the FDW
-            # hop still needs the instance's own private IP, not localhost -
-            # Cloud SQL specifically rejects loopback connections here.
+            # FDW hop uses the server's own view of itself, not the
+            # client-facing host/port - see DatabaseTunnel in src/tunnel.py.
             remote = DBConnection(
-                host=instance_info.private_ip, port=_POSTGRES_PORT, username=username,
+                host=resolved_server_host, port=resolved_server_port, username=username,
                 dbname=branch_info.base_database, password=password,
             )
             link_dbs(local, remote)
 
             local_engine = setup_engine(t.host, t.port, branch_info.modify_database, username, password)
-            patch_sql = make_diff_patch(local_engine)
+            try:
+                patch_sql = make_diff_patch(local_engine)
+            finally:
+                local_engine.dispose()
     except AuthProxyError as exc:
         raise click.ClickException(str(exc)) from exc
 
