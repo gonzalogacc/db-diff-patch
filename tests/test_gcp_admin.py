@@ -5,7 +5,7 @@ import pytest
 from google.auth.exceptions import DefaultCredentialsError
 from googleapiclient.errors import HttpError
 
-from src.gcp_admin import GCPAdminError, InstanceInfo, get_instance, list_instances
+from src.utils.gcp_admin import GCPAdminError, InstanceInfo, get_instance, list_instances
 
 
 @pytest.fixture
@@ -13,7 +13,7 @@ def mock_client():
     """Patch google.auth.default and the discovery client, returning the
     mocked sqladmin client for tests to configure."""
     with patch("google.auth.default", return_value=(MagicMock(), "test-project")):
-        with patch("src.gcp_admin.build") as mock_build:
+        with patch("src.utils.gcp_admin.build") as mock_build:
             client = MagicMock()
             mock_build.return_value = client
             yield client

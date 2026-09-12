@@ -9,12 +9,12 @@ from pytest import fixture, raises
 from sqlalchemy import UUID, Column, DateTime, ForeignKey, Integer, MetaData, String, Table, text
 from sqlalchemy.orm import Session
 
+from src.models import NoPrimaryKeyError
 from src.db_engine import setup_engine
 from src.differ import (
     CyclicForeignKeysError,
     DBConnection,
     DatabaseOperation,
-    NoPrimaryKeyError,
     OperationType,
     _build_table_graph,
     _topological_table_sort,

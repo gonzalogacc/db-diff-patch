@@ -1,43 +1,20 @@
 import sys
 from copy import copy
-from dataclasses import dataclass
-from enum import StrEnum
 from pathlib import Path
 
 from networkx import DiGraph, find_cycle, is_directed_acyclic_graph, topological_sort
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
-from sqlalchemy.sql.compiler import SQLCompiler
 
+from src.models import DBConnection, DatabaseOperation, NoPrimaryKeyError, OperationType, TablePair
 from src.db_engine import setup_engine
 
 
-@dataclass
-class DBConnection:
-    host: str
-    port: int
-    username: str
-    dbname: str
-    password: str | None = None
-
-@dataclass
-class DBPair:
-    """local: database with the changes. remote: original database."""
-    local: DBConnection
-    remote: DBConnection
-
-
-class OperationType(StrEnum):
-    DELETE = "delete"
-    UPDATE = "update"
-    INSERT = "insert"
-
-
-@dataclass
-class DatabaseOperation:
-    table_name: str
-    operation: OperationType
-    statement: SQLCompiler
+_OPERATION_PHASE = {
+    OperationType.INSERT: 0,
+    OperationType.UPDATE: 1,
+    OperationType.DELETE: 2,
+}
 
 
 def link_dbs(local: DBConnection, remote: DBConnection):
@@ -108,10 +85,6 @@ def _link_dbs_with_engine(local_engine, remote: DBConnection) -> None:
             )
 
         session.commit()
-
-
-class NoPrimaryKeyError(Exception):
-    """Raised when a table has no primary key, so it can't be safely diffed."""
 
 
 def get_table_keys(table: sa.Table) -> list[sa.Column]:
@@ -233,12 +206,6 @@ def check_updates(engine, local_table: sa.Table, remote_table: sa.Table) -> list
             )
 
     return update_list
-
-
-@dataclass
-class TablePair:
-    prod: sa.Table
-    clone: sa.Table
 
 
 def get_tables(engine):
@@ -366,12 +333,6 @@ def _topological_table_sort(graph) -> list[str]:
     tps = topological_sort(graph)
     return list(reversed(list(tps)))
 
-
-_OPERATION_PHASE = {
-    OperationType.INSERT: 0,
-    OperationType.UPDATE: 1,
-    OperationType.DELETE: 2,
-}
 
 
 def sort_ops(ops: list[DatabaseOperation], table_order: list[str]) -> list[DatabaseOperation]:

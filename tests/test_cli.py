@@ -5,7 +5,7 @@ from click.testing import CliRunner
 
 from src.branches import BranchError, BranchInfo
 from src.cli import cli
-from src.gcp_admin import GCPAdminError, InstanceInfo
+from src.utils.gcp_admin import GCPAdminError, InstanceInfo
 
 
 def _instance(name, private_ip: str | None = "10.0.0.1", public_ip: str | None = "34.0.0.1"):
@@ -204,6 +204,47 @@ def test_diff_reports_branch_not_found():
 
     assert result.exit_code != 0
     assert "No branch named" in result.output
+
+
+def test_branch_list_direct_host_port_skips_auth_proxy():
+    runner = CliRunner()
+    with patch("src.cli.AuthProxyTunnel") as mock_tunnel_cls, \
+         patch("src.cli.get_instance") as mock_get_instance, \
+         patch("src.cli.setup_engine", return_value=MagicMock()) as mock_setup_engine, \
+         patch("src.cli.list_branches", return_value=[]):
+        result = runner.invoke(cli, [
+            "branch", "list",
+            "--host", "10.0.0.5", "--port", "5432",
+            "--username", "app_user",
+        ])
+
+    assert result.exit_code == 0, result.output
+    mock_tunnel_cls.assert_not_called()
+    mock_get_instance.assert_not_called()
+    mock_setup_engine.assert_called_once_with("10.0.0.5", 5432, "template1", "app_user", None)
+
+
+def test_diff_direct_host_port_defaults_fdw_to_host_port(tmp_path):
+    runner = CliRunner()
+    branch_info = BranchInfo(name="feature_x", base_database="feature_x_base",
+                              modify_database="feature_x_modify", source_database="app")
+    output_path = tmp_path / "patch.sql"
+
+    with patch("src.cli.setup_engine", return_value=MagicMock()), \
+         patch("src.cli.get_branch", return_value=branch_info), \
+         patch("src.cli.link_dbs") as mock_link_dbs, \
+         patch("src.cli.make_diff_patch", return_value="BEGIN;\nCOMMIT;"):
+        result = runner.invoke(cli, [
+            "diff", "feature-x",
+            "--host", "10.0.0.5", "--port", "5432",
+            "--username", "app_user",
+            "-o", str(output_path),
+        ])
+
+    assert result.exit_code == 0, result.output
+    _local, remote = mock_link_dbs.call_args[0]
+    assert remote.host == "10.0.0.5"
+    assert remote.port == 5432
 
 
 def test_apply_calls_apply_patch_file(tmp_path):
