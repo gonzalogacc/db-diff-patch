@@ -1,6 +1,11 @@
-"""Context manager contract for a live database connection, plus its two
-production implementations. A third, test-only implementation
-(DockerPostgresTunnel) is in tests/docker_postgres.py.
+"""cloud-sql-proxy tunnel to a Cloud SQL instance.
+
+host/port is the client-facing address to connect to; server_host/server_port
+is the address the database server uses to reach itself (needed for
+postgres_fdw's server-to-server hop). The direct (non-GCP) connection path
+has no tunnel at all - see _connect()/diff() in src/cli.py. A third,
+test-only addressing scheme (DockerPostgresTunnel) is in
+tests/docker_postgres.py.
 """
 
 import shutil
@@ -9,47 +14,13 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import Protocol
 
-from src.gcp_admin import InstanceInfo
+from src.utils.gcp_admin import InstanceInfo
 
 _BINARY = "cloud-sql-proxy"
 _STARTUP_TIMEOUT = 30
 _STARTUP_POLL_INTERVAL = 0.5
 _POSTGRES_PORT = 5432
-
-
-class DatabaseTunnel(Protocol):
-    """host/port: client address. server_host/server_port: address the
-    database server uses to reach itself. Read-only properties, not plain
-    fields - AuthProxyTunnel.server_host is computed."""
-
-    host: str
-    port: int
-
-    @property
-    def server_host(self) -> str: ...
-    @property
-    def server_port(self) -> int: ...
-
-    def __enter__(self) -> "DatabaseTunnel": ...
-    def __exit__(self, exc_type, exc, tb) -> None: ...
-
-
-class DirectTunnel:
-    """No-op tunnel for a Postgres server reachable directly at host/port."""
-
-    def __init__(self, host: str, port: int, server_host: str | None = None, server_port: int | None = None):
-        self.host = host
-        self.port = port
-        self.server_host = server_host if server_host is not None else host
-        self.server_port = server_port if server_port is not None else port
-
-    def __enter__(self) -> "DirectTunnel":
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        pass
 
 
 class AuthProxyError(Exception):
