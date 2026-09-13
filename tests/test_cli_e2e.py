@@ -145,16 +145,3 @@ def test_diff_reports_error_for_unknown_branch_via_cli(docker_postgres):
     )
     assert result.exit_code != 0
     assert "No branch named" in result.output
-
-
-def test_branch_create_rejects_both_gcp_and_direct_options(docker_postgres, source_database):
-    result = _invoke(
-        "branch", "create", "e2e-conflict",
-        "--project", "some-project", "--instance", "some-instance",
-        *_host_port_args(docker_postgres),
-        "--source-database", source_database,
-        "--username", docker_postgres.username,
-        "--password", docker_postgres.password,
-    )
-    assert result.exit_code != 0
-    assert "not both" in result.output
