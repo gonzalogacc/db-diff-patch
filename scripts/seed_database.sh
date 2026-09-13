@@ -1,13 +1,21 @@
 #!/usr/bin/env bash
 #
-# Creates DBNAME (if it doesn't already exist) and runs seed.sql (or
-# another SQL file) against it - a Postgres server already reachable at
-# 127.0.0.1:PORT, e.g. a cloud-sql-proxy tunnel you started yourself.
-# Doesn't manage any tunnel itself.
+# Creates DBNAME if it does not exist yet. Then runs a SQL file against it.
+# The target server must already be reachable at 127.0.0.1:PORT, for
+# example through a cloud-sql-proxy tunnel you started yourself. This
+# script does not start or manage a tunnel.
 #
 # Usage: ./scripts/seed_database.sh [DBNAME=production_database] [DBUSER=postgres] [PASSWORD] [PORT=5433] [SQL_FILE=seed.sql]
-# If PASSWORD is omitted, psql prompts/.pgpass - needs a real tty. Pass it
-# explicitly on "fe_sendauth: no password supplied".
+#
+# These are positional arguments, not flags. To set PASSWORD, you must
+# also pass DBNAME and DBUSER before it, even the default values. Example:
+# "seed_database.sh production_database postgres mypassword" is correct.
+# "seed_database.sh production_database mypassword" puts "mypassword" into
+# DBUSER, not PASSWORD.
+#
+# If you omit PASSWORD, psql prompts for it, or uses .pgpass. This needs a
+# real terminal. Pass PASSWORD directly if you see this error:
+# "fe_sendauth: no password supplied".
 
 set -euo pipefail
 

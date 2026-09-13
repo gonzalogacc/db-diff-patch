@@ -1,12 +1,21 @@
 #!/usr/bin/env bash
 #
-# Opens an interactive psql session against a Postgres server already
-# reachable at 127.0.0.1:PORT - e.g. a cloud-sql-proxy tunnel you started
-# yourself. Doesn't manage any tunnel itself.
+# Opens an interactive psql session against a Postgres server. The server
+# must already be reachable at 127.0.0.1:PORT, for example through a
+# cloud-sql-proxy tunnel you started yourself. This script does not start
+# or manage a tunnel.
 #
 # Usage: ./scripts/connect_psql.sh [DBNAME=postgres] [DBUSER=postgres] [PASSWORD] [PORT=5433]
-# If PASSWORD is omitted, psql prompts/.pgpass - needs a real tty. Pass it
-# explicitly on "fe_sendauth: no password supplied".
+#
+# These are positional arguments, not flags. To set PASSWORD, you must
+# also pass DBNAME and DBUSER before it, even the default values. Example:
+# "connect_psql.sh mydb postgres mypassword" is correct.
+# "connect_psql.sh mydb mypassword" puts "mypassword" into DBUSER, not
+# PASSWORD.
+#
+# If you omit PASSWORD, psql prompts for it, or uses .pgpass. This needs a
+# real terminal. Pass PASSWORD directly if you see this error:
+# "fe_sendauth: no password supplied".
 
 set -euo pipefail
 

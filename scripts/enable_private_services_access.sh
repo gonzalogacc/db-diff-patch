@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 #
-# Required once per network before create_test_instance.sh. Reserves an IP
-# range for Google-managed services and peers it with the VPC - what makes
-# --network=... (private IP) work on `gcloud sql instances create`.
+# Sets up Private Services Access for one network. Run this once per
+# network, before create_test_instance.sh. It reserves an IP range for
+# Google-managed services and peers it with the network. This is what
+# makes a private IP work on a Cloud SQL instance.
 #
-# Safe to re-run.
+# Safe to run more than once.
 #
-# Usage: ./scripts/enable_private_services_access.sh [NETWORK]
+# This script uses the project set in your gcloud config. Run
+# "gcloud config set project YOUR_PROJECT" first if needed.
+#
+# Usage: ./scripts/enable_private_services_access.sh [NETWORK=default]
 
 set -euo pipefail
 

@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 #
-# Starts a disposable local Postgres container (docker run --rm -d) and
-# seeds it from seed.sql, so db-differ can be tried out by hand without a
-# GCP project. No named volume - `docker stop` removes the container and
-# all its data, nothing left behind.
+# Starts a disposable local Postgres container. Then seeds it from
+# seed.sql. Use this to try db-differ by hand, without a GCP project. The
+# container has no named volume. "docker stop" removes the container and
+# all its data.
 #
 # Usage: ./scripts/start_local_postgres.sh [DBNAME=postgres] [PORT=5433] [SQL_FILE=seed.sql]
-# These are positional - to set SQL_FILE you must also pass DBNAME and PORT
-# first (even if they're just the defaults).
 #
-# Needs `docker` and `psql` on PATH.
+# These are positional arguments, not flags. To set SQL_FILE, you must
+# also pass DBNAME and PORT before it, even the default values.
+#
+# This script needs docker and psql on PATH.
 
 set -euo pipefail
 

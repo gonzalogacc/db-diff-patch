@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 #
-# Deletes a disposable Cloud SQL instance created by create_test_instance.sh
-# (or any instance you pass by name). Deletes the persistent disk with it -
-# there's no undo.
+# Deletes a Cloud SQL instance and its disk. There is no undo.
+#
+# This script uses the project set in your gcloud config. Run
+# "gcloud config set project YOUR_PROJECT" first if needed.
+#
+# Usage: ./scripts/delete_test_instance.sh [INSTANCE_NAME=test-pg-instance]
 
 set -euo pipefail
 
-# Set default instance name or take from first argument
 INSTANCE_NAME=${1:-"test-pg-instance"}
 
 echo "Deleting Cloud SQL instance: ${INSTANCE_NAME}..."

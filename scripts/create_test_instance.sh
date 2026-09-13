@@ -1,14 +1,21 @@
 #!/usr/bin/env bash
 #
-# Creates a disposable Cloud SQL Postgres instance for the real-environment
-# smoke test in README.md. Throwaway only - root password hardcoded.
+# Creates a disposable Cloud SQL Postgres instance. Use it for the
+# real-environment smoke test in README.md. This instance is for testing
+# only. The root password is hardcoded.
 #
-# Needs both IPs: private for `diff`'s postgres_fdw hop (Cloud SQL rejects
-# loopback connections, even same-instance), public so a machine outside
-# the VPC can reach it via the Auth Proxy.
+# The instance gets two IP addresses. `diff`'s postgres_fdw hop needs the
+# private IP. Cloud SQL rejects a loopback connection there, even from an
+# instance to itself. A client outside the VPC needs the public IP to
+# reach the instance through the Auth Proxy.
 #
-# Requires Private Services Access on NETWORK first - run
-# scripts/enable_private_services_access.sh once per network.
+# Run scripts/enable_private_services_access.sh once per network, before
+# this script.
+#
+# This script uses the project set in your gcloud config. Run
+# "gcloud config set project YOUR_PROJECT" first if needed.
+#
+# Usage: ./scripts/create_test_instance.sh [INSTANCE_NAME=test-pg-instance] [NETWORK=default]
 
 set -euo pipefail
 
