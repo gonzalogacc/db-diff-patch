@@ -23,40 +23,44 @@ uv sync
 # one-time per project/network
 ./scripts/enable_private_services_access.sh
 ./scripts/create_test_instance.sh source-test-instance
-./scripts/seed_database.sh source-test-instance postgres postgres "MyTestPassword123!"
+# ^ prints the postgres user's password when done
 
 # open one tunnel, reuse it for every command below
 cloud-sql-proxy --port 5433 testproject-235011:us-central1:source-test-instance &
 
+# If you don't want to user GCP start from here
+./scripts/seed_database.sh production_database postgres "MyTestPassword123!" 5433
+
 # branch -> edit -> diff
 uv run db-differ branch create smoke-test \
   --host 127.0.0.1 --port 5433 \
-  --source-database postgres --username postgres --password "MyTestPassword123!"
+  --source-database production_database --username postgres --password "MyTestPassword123!"
 
-./scripts/connect_psql.sh source-test-instance smoke_test_modify postgres "MyTestPassword123!"
+./scripts/connect_psql.sh smoke_test_modify postgres "MyTestPassword123!" 5433
 # => DELETE FROM some_table WHERE id = 1;
 
 # --server-host: postgres_fdw's own view of the server for its self-hop -
 # Cloud SQL rejects loopback there, so it needs the instance's private IP
-PRIVATE_IP=$(gcloud sql instances describe source-test-instance \
-  --flatten="ipAddresses[]" --filter="ipAddresses.type=PRIVATE" \
-  --format="value(ipAddresses.ipAddress)")
+PRIVATE_IP=$(gcloud sql instances describe source-test-instance --format=json \
+  | jq -r '.ipAddresses[] | select(.type=="PRIVATE") | .ipAddress')
 uv run db-differ diff smoke-test \
   --host 127.0.0.1 --port 5433 \
   --server-host "${PRIVATE_IP}" --server-port 5432 \
   --username postgres --password "MyTestPassword123!" \
   -o patch.sql
 
-# apply back onto postgres on source-test-instance - the database
-# smoke_test_base/modify were cloned from, so this is effectively "prod"
+# apply back onto production_database on source-test-instance - the
+# database smoke_test_base/modify were cloned from, so this is effectively "prod"
 uv run db-differ apply patch.sql \
   --host 127.0.0.1 --port 5433 \
-  --username postgres --dbname postgres --password "MyTestPassword123!"
+  --username postgres --dbname production_database --password "MyTestPassword123!"
 
 # clean up
 uv run db-differ branch drop smoke-test \
   --host 127.0.0.1 --port 5433 \
   --username postgres --password "MyTestPassword123!"
+
+# If you are not using GCP this is not needed
 ./scripts/delete_test_instance.sh source-test-instance
 kill %1  # stop the cloud-sql-proxy tunnel started above
 ```
@@ -71,24 +75,25 @@ defaults, shown below.
 |---|---|---|
 | `enable_private_services_access.sh` | `[NETWORK=default]` | One-time, per-network setup that `create_test_instance.sh` depends on for its private IP. Safe to re-run. See the script's header. |
 | `create_test_instance.sh` | `[INSTANCE_NAME=test-pg-instance] [NETWORK=default]` | Creates a disposable Cloud SQL Postgres instance with both a public and a private IP. Prints the `postgres` user's password when done. |
-| `seed_database.sh` | `[INSTANCE_NAME] [DBNAME=postgres] [DBUSER=postgres] [PASSWORD] [PORT] [SQL_FILE=seed.sql]` | Tunnels through the Auth Proxy and runs a SQL file against the instance non-interactively. |
-| `connect_psql.sh` | `[INSTANCE_NAME] [DBNAME=postgres] [DBUSER=postgres] [PASSWORD] [PORT]` | Same tunnel, but drops you into an interactive `psql` session instead. |
+| `seed_database.sh` | `[DBNAME=production_database] [DBUSER=postgres] [PASSWORD] [PORT=5433] [SQL_FILE=seed.sql]` | Creates DBNAME if it doesn't exist yet, then runs a SQL file against it - a Postgres server already reachable at `127.0.0.1:PORT` (e.g. a tunnel you started yourself). |
+| `connect_psql.sh` | `[DBNAME=postgres] [DBUSER=postgres] [PASSWORD] [PORT=5433]` | Same connection, but drops you into an interactive `psql` session instead. |
 | `delete_test_instance.sh` | `[INSTANCE_NAME=test-pg-instance]` | Deletes an instance and its disk. No undo. |
 
-`PORT` defaults to a freshly picked free port each run (not a fixed one),
-so a leftover proxy process from an earlier run can't make a new one
-silently connect to the wrong (stale) tunnel.
+`seed_database.sh` and `connect_psql.sh` don't manage a tunnel themselves -
+open one yourself first (see "Connecting to a database" below) and pass its
+port. This is also why they no longer take `INSTANCE_NAME`: they only ever
+talk to `127.0.0.1:PORT`, whatever that happens to be pointed at.
 
 **These are positional, not flags** - to set `PASSWORD` you must also pass
 `DBNAME` and `DBUSER` before it (even if they're just the defaults), or it
-lands in the wrong slot. `seed_database.sh source-test-instance
-"mypassword"` puts `"mypassword"` into `DBNAME`, not `PASSWORD` - use
-`seed_database.sh source-test-instance postgres postgres "mypassword"`.
+lands in the wrong slot. `seed_database.sh production_database
+"mypassword"` puts `"mypassword"` into `DBUSER`, not `PASSWORD` - use
+`seed_database.sh production_database postgres "mypassword"`.
 
-All of them act on whatever project your `gcloud` config currently points
-at - run `gcloud config set project YOUR_PROJECT` first if needed.
-`seed_database.sh` and `connect_psql.sh` also need the `cloud-sql-proxy`
-binary on `PATH`, and both stop their tunnel automatically when they exit.
+`create_test_instance.sh`/`delete_test_instance.sh`/
+`enable_private_services_access.sh` act on whatever project your `gcloud`
+config currently points at - run `gcloud config set project YOUR_PROJECT`
+first if needed.
 
 ## Connecting to a database
 
@@ -153,19 +158,15 @@ between `base` and `modify` has to target the instance's real private IP.
   ```
   It prints the `postgres` user's password when done - that's your
   `--username`/password for the steps below.
-- `seed.sql` in this repo creates the same FK-rich fixture schema the test
-  suite uses (see `schema.md`) and seeds it with sample rows - run it once
-  against `SOURCE` (or point `branch create` at whatever database you
-  already have there instead):
-  ```sh
-  ./scripts/seed_database.sh source-test-instance postgres postgres "<password>"
-  ```
 - The [Cloud SQL Auth Proxy](https://cloud.google.com/sql/docs/postgres/sql-proxy)
   binary (`cloud-sql-proxy`) installed and on `PATH` - `db-differ` itself
   never calls it; you start and stop it yourself.
 - `gcloud auth application-default login` (or plain `gcloud auth login`) so
   `gcloud sql instances describe` works, used below to fetch the instance's
   connection name and private IP.
+- `jq` on `PATH`, to pull the private IP out of `gcloud`'s JSON output
+  (`describe` returns one resource, not a list, so `gcloud`'s own
+  `--filter` flag doesn't apply here).
 - `uv sync` to install this project's dependencies.
 
 ### 1. Open a tunnel
@@ -178,18 +179,32 @@ CONNECTION_NAME=$(gcloud sql instances describe source-test-instance --format="v
 cloud-sql-proxy --port 5433 "${CONNECTION_NAME}" &
 ```
 
-### 2. Create a branch
+### 2. Seed the database
+
+`seed_database.sh` creates `production_database` on `SOURCE` (through the
+tunnel just opened) if it doesn't already exist, then seeds it from
+`seed.sql` in this repo - the same FK-rich fixture schema the test suite
+uses (see `schema.md`):
+
+```sh
+./scripts/seed_database.sh production_database postgres "<password>" 5433
+```
+
+(Or point `branch create` below at whatever database you already have on
+`SOURCE` instead.)
+
+### 3. Create a branch
 
 ```sh
 uv run db-differ branch create smoke-test \
   --host 127.0.0.1 --port 5433 \
-  --source-database postgres \
+  --source-database production_database \
   --username postgres \
   --password "<password>"
 ```
 
-Creates `smoke_test_base` (`CREATE DATABASE ... TEMPLATE postgres`) and
-`smoke_test_modify` (templated off `smoke_test_base`) on
+Creates `smoke_test_base` (`CREATE DATABASE ... TEMPLATE production_database`)
+and `smoke_test_modify` (templated off `smoke_test_base`) on
 `source-test-instance`. No new instances, so this should be quick.
 
 ```sh
@@ -198,25 +213,24 @@ uv run db-differ branch list --host 127.0.0.1 --port 5433 --username postgres --
 
 should now show `smoke_test` with both database names.
 
-### 3. Make a change on `modify`
+### 4. Make a change on `modify`
 
 Connect to the `modify` database directly and edit some data, to simulate
 the curation work this tool is meant to capture:
 
 ```sh
-./scripts/connect_psql.sh source-test-instance smoke_test_modify postgres "<password>"
+./scripts/connect_psql.sh smoke_test_modify postgres "<password>" 5433
 => DELETE FROM some_table WHERE id = 1;
 ```
 
-### 4. Diff the branch
+### 5. Diff the branch
 
 `postgres_fdw`'s self-hop needs the instance's private IP, not the tunnel's
 loopback address - fetch it once:
 
 ```sh
-PRIVATE_IP=$(gcloud sql instances describe source-test-instance \
-  --flatten="ipAddresses[]" --filter="ipAddresses.type=PRIVATE" \
-  --format="value(ipAddresses.ipAddress)")
+PRIVATE_IP=$(gcloud sql instances describe source-test-instance --format=json \
+  | jq -r '.ipAddresses[] | select(.type=="PRIVATE") | .ipAddress')
 
 uv run db-differ diff smoke-test \
   --host 127.0.0.1 --port 5433 \
@@ -229,26 +243,27 @@ uv run db-differ diff smoke-test \
 Inspect `patch.sql` - it should be a `BEGIN; ... COMMIT;` script containing
 just the delete (or whatever you changed), in FK-safe order.
 
-### 5. Apply the patch back to `postgres`
+### 6. Apply the patch back to `production_database`
 
-`smoke_test_base`/`smoke_test_modify` were cloned from `postgres` on
-`SOURCE`, so applying the patch back to `postgres` there is effectively
-"promoting" the edit you made on `modify` back into the database it came
-from - `apply` is fully standalone and reuses the same tunnel:
+`smoke_test_base`/`smoke_test_modify` were cloned from `production_database`
+on `SOURCE`, so applying the patch back to `production_database` there is
+effectively "promoting" the edit you made on `modify` back into the
+database it came from - `apply` is fully standalone and reuses the same
+tunnel:
 
 ```sh
 uv run db-differ apply patch.sql \
   --host 127.0.0.1 --port 5433 \
-  --username postgres --dbname postgres --password "<password>"
+  --username postgres --dbname production_database --password "<password>"
 ```
 
 (Point `--host`/`--dbname` at a different, truly disposable target instead
-if you'd rather not mutate `SOURCE`'s own `postgres` database.)
+if you'd rather not mutate `SOURCE`'s own `production_database`.)
 
-Then check `postgres` on `SOURCE` directly and confirm it now matches
-`modify`'s state for the table(s) you touched.
+Then check `production_database` on `SOURCE` directly and confirm it now
+matches `modify`'s state for the table(s) you touched.
 
-### 6. Clean up
+### 7. Clean up
 
 ```sh
 uv run db-differ branch drop smoke-test --host 127.0.0.1 --port 5433 --username postgres --password "<password>"
