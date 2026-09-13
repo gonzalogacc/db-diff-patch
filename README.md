@@ -12,12 +12,51 @@ both clones with `CREATE DATABASE ... TEMPLATE`.
 
 ## Quick Start
 
-This is a real, runnable example. It can use a gcp project and the test password `MyTestPassword123!`. `create_test_instance.sh` sets this password. Use your own project ID and password if you set this
-up yourself.
+Two real, runnable examples. Use the local one to try the tool with no
+GCP project at all. Use the GCP one against a real Cloud SQL instance.
 
-The full explanation of each step is in "Verifying the toolset against a
-real GCP project" below. That section covers prerequisites and
-troubleshooting.
+### Local database
+
+```sh
+uv sync
+
+./scripts/start_local_postgres.sh production_database 5433
+# ^ starts a disposable local Postgres container and seeds production_database
+
+# branch -> edit -> diff
+uv run db-differ branch create smoke-test \
+  --host 127.0.0.1 --port 5433 \
+  --source-database production_database --username postgres --password postgres
+
+./scripts/connect_psql.sh smoke_test_modify postgres postgres 5433
+# => DELETE FROM some_table WHERE id = 1;
+
+# --server-host/--server-port: the container publishes port 5433 for your
+# client, but Postgres inside the container reaches itself at port 5432.
+uv run db-differ diff smoke-test \
+  --host 127.0.0.1 --port 5433 \
+  --server-host localhost --server-port 5432 \
+  --username postgres --password postgres \
+  -o patch.sql
+
+# apply back onto production_database - smoke_test_base and
+# smoke_test_modify were cloned from it, so this promotes the edit into "prod"
+uv run db-differ apply patch.sql \
+  --host 127.0.0.1 --port 5433 \
+  --username postgres --dbname production_database --password postgres
+
+# clean up
+uv run db-differ branch drop smoke-test \
+  --host 127.0.0.1 --port 5433 \
+  --username postgres --password postgres
+docker stop <container name>  # printed by start_local_postgres.sh
+```
+
+### GCP (Cloud SQL)
+
+Real, runnable example against project `testproject-235011`, using the
+throwaway test password `MyTestPassword123!` that `create_test_instance.sh`
+sets. Use your own project ID and password if you set this up yourself.
 
 ```sh
 uv sync
@@ -30,7 +69,6 @@ uv sync
 # open one tunnel, reuse it for every command below
 cloud-sql-proxy --port 5433 testproject-235011:us-central1:source-test-instance &
 
-# If you do not want to use GCP, start from here
 ./scripts/seed_database.sh production_database postgres "MyTestPassword123!" 5433
 
 # branch -> edit -> diff
@@ -51,9 +89,9 @@ uv run db-differ diff smoke-test \
   --username postgres --password "MyTestPassword123!" \
   -o patch.sql
 
-# Apply back onto production_database on source-test-instance.
-# smoke_test_base and smoke_test_modify were cloned from this database,
-# so this step promotes the edit into "prod".
+# apply back onto production_database on source-test-instance - it is
+# where smoke_test_base and smoke_test_modify were cloned from, so this
+# promotes the edit into "prod"
 uv run db-differ apply patch.sql \
   --host 127.0.0.1 --port 5433 \
   --username postgres --dbname production_database --password "MyTestPassword123!"
@@ -62,8 +100,6 @@ uv run db-differ apply patch.sql \
 uv run db-differ branch drop smoke-test \
   --host 127.0.0.1 --port 5433 \
   --username postgres --password "MyTestPassword123!"
-
-# If you are not using GCP, this step is not needed
 ./scripts/delete_test_instance.sh source-test-instance
 kill %1  # stop the cloud-sql-proxy tunnel started above
 ```
@@ -74,12 +110,27 @@ Every command (`branch create`/`list`/`drop`, `diff`, `apply`) takes `--host` an
 
 For a Cloud SQL instance, open a tunnel to it yourself first. For example: `cloud-sql-proxy --port PORT PROJECT:REGION:INSTANCE &`, as in the Quick Start above. Then point `--host`/`--port` at `127.0.0.1:PORT`.
 
-`diff` also has a `--server-host`/`--server-port` pair. Use these when
-the server's own address differs from the address your client connects
-through. Two examples: a docker container's published port differs from
-its internal `5432`, and Cloud SQL rejects `postgres_fdw`'s loopback
-self-connection. See `diff()` in `src/cli.py` for exactly where `host`,
-`port`, `server_host`, and `server_port` are used.
+`diff` connects to two different addresses.
+
+`--host`/`--port` is the address your client uses to run SQL against the
+Postgres server. This is a normal, direct connection.
+
+`--server-host`/`--server-port` is the address the Postgres server itself
+uses to reach the other database. `diff` links `base` and `modify`
+together with `postgres_fdw`. `postgres_fdw` opens its own connection,
+from inside the Postgres server process, to whatever address you give it.
+This can be a different address than the one your client used.
+
+Two examples:
+- A docker container publishes a port for your client. A process inside
+  the container reaches itself through a different address, for example
+  `localhost:5432`.
+- A Cloud SQL instance rejects a loopback connection for `postgres_fdw`,
+  even from an instance to itself. Use the instance's private IP instead.
+
+`--server-host`/`--server-port` default to `--host`/`--port`. Set them
+only when the two addresses differ. See `diff()` in `src/cli.py` for
+where each address is used.
 
 ### Spinning up a local Postgres to try it against
 
