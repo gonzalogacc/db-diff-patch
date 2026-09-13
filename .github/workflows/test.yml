@@ -3,6 +3,11 @@ name: Tests
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - README.md
+
+permissions:
+  contents: write
 
 jobs:
   test:
@@ -35,3 +40,18 @@ jobs:
 
       - name: Run tests
         run: make test
+
+      - name: Update coverage badge
+        run: |
+          PCT=$(uv run coverage report --format=total)
+          if [ "${PCT}" -ge 90 ]; then COLOR=brightgreen
+          elif [ "${PCT}" -ge 75 ]; then COLOR=yellow
+          else COLOR=red
+          fi
+          sed -i -E "s#coverage-[0-9]+%25-[a-z]+#coverage-${PCT}%25-${COLOR}#" README.md
+
+      - name: Commit coverage badge
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Update coverage badge"
+          file_pattern: README.md

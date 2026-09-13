@@ -27,6 +27,7 @@ packages = ["src"]
 dev = [
     "pyright>=1.1.411",
     "pytest>=9.1.1",
+    "pytest-cov>=7.0.0",
     "ruff>=0.15.22",
 ]
 
@@ -34,6 +35,9 @@ dev = [
 pythonpath = [
   "."
 ]
+
+[tool.coverage.run]
+source = ["src"]
 
 [tool.pyright]
 include = ["src", "tests"]

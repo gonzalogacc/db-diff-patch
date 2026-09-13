@@ -1,5 +1,8 @@
 # db-diff-patch
 
+[![Tests](https://github.com/gonzalogacc/db-diff-patch/actions/workflows/test.yml/badge.svg)](https://github.com/gonzalogacc/db-diff-patch/actions/workflows/test.yml)
+![Coverage](https://img.shields.io/badge/coverage-98%25-brightgreen)
+
 This tool computes a SQL patch between two Postgres databases. It
 also provides a `db-differ` CLI.
 

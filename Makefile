@@ -5,4 +5,4 @@ lint:
 	uv run pyright
 
 test:
-	uv run pytest -v .
+	uv run pytest -v --cov=src --cov-report=term-missing .
