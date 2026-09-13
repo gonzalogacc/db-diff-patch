@@ -1,8 +1,13 @@
 # db-diff-patch
 
-Computes an FK-safe SQL patch between two Postgres databases, and (for GCP)
-a `db-differ` CLI that branches a database on a Cloud SQL instance, diffs
-the branch, and applies the resulting patch to a target database.
+Computes an FK-safe SQL patch between two Postgres databases, and a
+`db-differ` CLI that branches a database (base + modify clones via
+`CREATE DATABASE ... TEMPLATE`), diffs the branch, and applies the
+resulting patch to a target database. The CLI only ever speaks plain
+`--host`/`--port` Postgres - it has no GCP awareness at all. To reach a
+Cloud SQL instance, open a tunnel to it yourself first (e.g. the Cloud SQL
+Auth Proxy) and point `--host`/`--port` at that tunnel, same as any other
+reachable Postgres server.
 
 ## Quick Start
 
@@ -20,31 +25,40 @@ uv sync
 ./scripts/create_test_instance.sh source-test-instance
 ./scripts/seed_database.sh source-test-instance postgres postgres "MyTestPassword123!"
 
+# open one tunnel, reuse it for every command below
+cloud-sql-proxy --port 5433 testproject-235011:us-central1:source-test-instance &
+
 # branch -> edit -> diff
 uv run db-differ branch create smoke-test \
-  --project testproject-235011 --instance source-test-instance \
+  --host 127.0.0.1 --port 5433 \
   --source-database postgres --username postgres --password "MyTestPassword123!"
 
 ./scripts/connect_psql.sh source-test-instance smoke_test_modify postgres "MyTestPassword123!"
 # => DELETE FROM some_table WHERE id = 1;
 
+# --server-host: postgres_fdw's own view of the server for its self-hop -
+# Cloud SQL rejects loopback there, so it needs the instance's private IP
+PRIVATE_IP=$(gcloud sql instances describe source-test-instance \
+  --flatten="ipAddresses[]" --filter="ipAddresses.type=PRIVATE" \
+  --format="value(ipAddresses.ipAddress)")
 uv run db-differ diff smoke-test \
-  --project testproject-235011 --instance source-test-instance \
+  --host 127.0.0.1 --port 5433 \
+  --server-host "${PRIVATE_IP}" --server-port 5432 \
   --username postgres --password "MyTestPassword123!" \
   -o patch.sql
 
 # apply back onto postgres on source-test-instance - the database
 # smoke_test_base/modify were cloned from, so this is effectively "prod"
-cloud-sql-proxy --port 5434 testproject-235011:us-central1:source-test-instance &
 uv run db-differ apply patch.sql \
-  --host 127.0.0.1 --port 5434 \
+  --host 127.0.0.1 --port 5433 \
   --username postgres --dbname postgres --password "MyTestPassword123!"
 
 # clean up
 uv run db-differ branch drop smoke-test \
-  --project testproject-235011 --instance source-test-instance \
+  --host 127.0.0.1 --port 5433 \
   --username postgres --password "MyTestPassword123!"
 ./scripts/delete_test_instance.sh source-test-instance
+kill %1  # stop the cloud-sql-proxy tunnel started above
 ```
 
 ## Scripts
@@ -76,31 +90,42 @@ at - run `gcloud config set project YOUR_PROJECT` first if needed.
 `seed_database.sh` and `connect_psql.sh` also need the `cloud-sql-proxy`
 binary on `PATH`, and both stop their tunnel automatically when they exit.
 
-## Connecting without GCP
+## Connecting to a database
 
-`branch create`/`list`/`drop` and `diff` normally resolve connectivity
-through `--project`/`--instance` (Cloud SQL Admin API + Auth Proxy), but
-accept `--host`/`--port` instead - a direct connection to any already-
-reachable Postgres server, GCP or not. Exactly one pair must be given.
-`apply` has always worked this way; this makes all four operations
-consistent, and it's how `tests/test_cli_e2e.py` drives the real CLI
-against a disposable docker Postgres container for testing, without a real
-GCP project.
+Every command (`branch create`/`list`/`drop`, `diff`, `apply`) takes just
+`--host`/`--port` - a direct connection to any already-reachable Postgres
+server. The CLI never talks to GCP itself; for a Cloud SQL instance, open a
+tunnel to it yourself (e.g. `cloud-sql-proxy --port PORT
+PROJECT:REGION:INSTANCE &`, as in the Quick Start above) and point
+`--host`/`--port` at `127.0.0.1:PORT`. This is also how
+`tests/test_cli_e2e.py` drives the real CLI against a disposable docker
+Postgres container for testing, without any GCP project at all.
 
 For `diff` specifically, if the target's server-facing address differs
 from what the client connects through (e.g. a docker container's published
-port vs. its internal `5432`), pass `--server-host`/`--server-port` to
-override what `postgres_fdw`'s server-to-server hop should use - see
-`src/tunnel.py` for why `host`/`port` and `server_host`/`server_port` can
-differ.
+port, or a Cloud SQL instance's loopback address rejected by
+`postgres_fdw`'s server-to-server hop), pass `--server-host`/`--server-port`
+to override what that hop should use - see `diff()` in `src/cli.py` for
+where `host`/`port` and `server_host`/`server_port` are applied.
+
+### Spinning up a local Postgres to try it against
+
+`./scripts/start_local_postgres.sh [DBNAME=postgres] [PORT=5433] [SQL_FILE=seed.sql]`
+starts a disposable `postgres:16` container (`docker run --rm -d`, no named
+volume) and seeds it from `seed.sql` - the same FK-rich fixture schema the
+test suite uses - so you have something real to point `branch`/`diff`/`apply`
+at without any GCP project. It prints the connection details and a
+ready-to-paste `db-differ branch create` command when done. Needs `docker`
+and `psql` on `PATH`. Stop and remove everything with `docker stop
+<container name>` (printed at the end).
 
 ## Verifying the toolset against a real GCP project
 
-The unit tests (`uv run pytest`) mock every GCP/Auth Proxy call for
-`gcp_admin.py`/`tunnel.py`, and exercise `branches.py`'s branch
-create/list/drop mechanism for real against local Postgres (via
-`pytest-postgresql`) - but none of that touches an actual Cloud SQL
-instance. Before relying on this against anything that matters, walk
+The unit tests (`uv run pytest`) exercise `branches.py`'s branch
+create/list/drop mechanism and the full CLI for real against local Postgres
+(via `pytest-postgresql` and a disposable docker container) - but none of
+that touches an actual Cloud SQL instance, since the CLI no longer knows
+GCP exists. Before relying on this against anything that matters, walk
 through the full branch → diff → apply loop by hand against a
 **disposable** project/instance.
 
@@ -136,25 +161,28 @@ between `base` and `modify` has to target the instance's real private IP.
   ./scripts/seed_database.sh source-test-instance postgres postgres "<password>"
   ```
 - The [Cloud SQL Auth Proxy](https://cloud.google.com/sql/docs/postgres/sql-proxy)
-  binary (`cloud-sql-proxy`) installed and on `PATH`.
-- `gcloud auth application-default login` run locally (Application Default
-  Credentials - what `google.auth.default()` picks up).
+  binary (`cloud-sql-proxy`) installed and on `PATH` - `db-differ` itself
+  never calls it; you start and stop it yourself.
+- `gcloud auth application-default login` (or plain `gcloud auth login`) so
+  `gcloud sql instances describe` works, used below to fetch the instance's
+  connection name and private IP.
 - `uv sync` to install this project's dependencies.
 
-### 1. Sanity-check connectivity
+### 1. Open a tunnel
+
+`db-differ` only ever connects to `--host`/`--port`, so start the Auth
+Proxy yourself once and reuse it for every command below:
 
 ```sh
-uv run db-differ list-databases --project YOUR_PROJECT
+CONNECTION_NAME=$(gcloud sql instances describe source-test-instance --format="value(connectionName)")
+cloud-sql-proxy --port 5433 "${CONNECTION_NAME}" &
 ```
-
-Confirms Admin API auth works and shows `source-test-instance` in the list.
 
 ### 2. Create a branch
 
 ```sh
 uv run db-differ branch create smoke-test \
-  --project YOUR_PROJECT \
-  --instance source-test-instance \
+  --host 127.0.0.1 --port 5433 \
   --source-database postgres \
   --username postgres \
   --password "<password>"
@@ -165,7 +193,7 @@ Creates `smoke_test_base` (`CREATE DATABASE ... TEMPLATE postgres`) and
 `source-test-instance`. No new instances, so this should be quick.
 
 ```sh
-uv run db-differ branch list --project YOUR_PROJECT --instance source-test-instance --username postgres --password "<password>"
+uv run db-differ branch list --host 127.0.0.1 --port 5433 --username postgres --password "<password>"
 ```
 
 should now show `smoke_test` with both database names.
@@ -182,10 +210,17 @@ the curation work this tool is meant to capture:
 
 ### 4. Diff the branch
 
+`postgres_fdw`'s self-hop needs the instance's private IP, not the tunnel's
+loopback address - fetch it once:
+
 ```sh
+PRIVATE_IP=$(gcloud sql instances describe source-test-instance \
+  --flatten="ipAddresses[]" --filter="ipAddresses.type=PRIVATE" \
+  --format="value(ipAddresses.ipAddress)")
+
 uv run db-differ diff smoke-test \
-  --project YOUR_PROJECT \
-  --instance source-test-instance \
+  --host 127.0.0.1 --port 5433 \
+  --server-host "${PRIVATE_IP}" --server-port 5432 \
   --username postgres \
   --password "<password>" \
   -o patch.sql
@@ -199,20 +234,16 @@ just the delete (or whatever you changed), in FK-safe order.
 `smoke_test_base`/`smoke_test_modify` were cloned from `postgres` on
 `SOURCE`, so applying the patch back to `postgres` there is effectively
 "promoting" the edit you made on `modify` back into the database it came
-from - `apply` is fully standalone and doesn't care whether the target is
-on GCP at all, so it just needs its own tunnel:
+from - `apply` is fully standalone and reuses the same tunnel:
 
 ```sh
-cloud-sql-proxy --port 5434 YOUR_PROJECT:us-central1:source-test-instance &
 uv run db-differ apply patch.sql \
-  --host 127.0.0.1 --port 5434 \
+  --host 127.0.0.1 --port 5433 \
   --username postgres --dbname postgres --password "<password>"
 ```
 
-(`us-central1` because that's the fixed region `create_test_instance.sh`
-always uses - adjust if `SOURCE` lives elsewhere. Point `--host`/`--dbname`
-at a different, truly disposable target instead if you'd rather not mutate
-`SOURCE`'s own `postgres` database.)
+(Point `--host`/`--dbname` at a different, truly disposable target instead
+if you'd rather not mutate `SOURCE`'s own `postgres` database.)
 
 Then check `postgres` on `SOURCE` directly and confirm it now matches
 `modify`'s state for the table(s) you touched.
@@ -220,7 +251,7 @@ Then check `postgres` on `SOURCE` directly and confirm it now matches
 ### 6. Clean up
 
 ```sh
-uv run db-differ branch drop smoke-test --project YOUR_PROJECT --instance source-test-instance --username postgres --password "<password>"
+uv run db-differ branch drop smoke-test --host 127.0.0.1 --port 5433 --username postgres --password "<password>"
 ```
 
 drops `smoke_test_base`/`smoke_test_modify` (fast - they're just
@@ -229,9 +260,8 @@ done with the whole run:
 
 ```sh
 ./scripts/delete_test_instance.sh source-test-instance
+kill %1  # stop the cloud-sql-proxy tunnel started in step 1
 ```
-
-and stop any `cloud-sql-proxy` processes you started by hand.
 
 ## Internals: manual FDW link (what `link_dbs` automates)
 
