@@ -1,7 +1,8 @@
 # Test fixture schema
 
 Tables defined in `tests/test_functions.py::_populate_db` (and mirrored in
-`seed.sql`), used as a test bed for the topological-sort ordering work.
+`seed.sql`). The test suite uses this schema to check FK-safe ordering,
+primary-key handling, and diff correctness.
 
 ```mermaid
 erDiagram
