@@ -57,9 +57,9 @@ docker stop <container name>  # printed by start_local_postgres.sh
 
 ### GCP (Cloud SQL)
 
-Real, runnable example against project `testproject-235011`, using the
-throwaway test password `MyTestPassword123!` that `create_test_instance.sh`
-sets. Use your own project ID and password if you set this up yourself.
+Runnable example against a Cloud SQL instance in your own project. Replace
+`YOUR_PROJECT` with your GCP project ID. The example uses the throwaway test
+password `MyTestPassword123!` that `create_test_instance.sh` sets.
 
 ```sh
 uv sync
@@ -70,7 +70,7 @@ uv sync
 # ^ prints the postgres user's password when done
 
 # open one tunnel, reuse it for every command below
-cloud-sql-proxy --port 5433 testproject-235011:us-central1:source-test-instance &
+cloud-sql-proxy --port 5433 YOUR_PROJECT:us-central1:source-test-instance &
 
 ./scripts/seed_database.sh production_database postgres "MyTestPassword123!" 5433
 
